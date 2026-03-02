@@ -673,7 +673,7 @@ app.post('/api/shopify-webhook', paymentLimiter, async (req, res) => {
     // ── 6. Call Till Debit API ────────────────────────────────────────────
     const tillRes = await callTillAPI(
       'POST',
-      `/transaction/${TILL_API_KEY}/debit`,
+      `/api/v3/transaction/${TILL_API_KEY}/debit`,
       debitPayload
     );
 
