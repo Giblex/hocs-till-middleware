@@ -1,0 +1,14 @@
+# HOCS Middleware — Shopify App Configuration
+# Links to the existing "HOCS Middleware" app in the Dev Dashboard.
+
+name = "HOCS Middleware"
+client_id = "0572f3c0994e7a23958e710689979129"
+
+[access_scopes]
+scopes = "write_orders,read_orders"
+
+[auth]
+redirect_urls = []
+
+[webhooks]
+api_version = "2025-01"

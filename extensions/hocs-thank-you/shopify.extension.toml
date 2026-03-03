@@ -1,0 +1,17 @@
+api_version = "2025-01"
+
+[[extensions]]
+type = "ui_extension"
+name = "HOCS Payment Redirect"
+handle = "hocs-payment-redirect"
+
+  [[extensions.targeting]]
+  target = "purchase.thank-you.block.render"
+  module = "./src/ThankYouPayment.jsx"
+
+[extensions.capabilities]
+network_access = true
+
+# Allow the extension to call our Railway middleware
+[[extensions.capabilities.network_access.allowed_domains]]
+host = "hocs-till-middleware-production.up.railway.app"

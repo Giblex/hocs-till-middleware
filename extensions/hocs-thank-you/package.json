@@ -1,0 +1,14 @@
+{
+  "name": "hocs-thank-you",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {},
+  "dependencies": {
+    "@shopify/ui-extensions-react": "2025.1.x",
+    "@shopify/ui-extensions": "2025.1.x",
+    "react": "^18.0.0"
+  },
+  "devDependencies": {
+    "@shopify/ui-extensions-dev-console": "latest"
+  }
+}

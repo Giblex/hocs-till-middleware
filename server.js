@@ -358,6 +358,7 @@ try {
 const stmts = {
   getTxn:        db.prepare('SELECT * FROM transactions WHERE txn_id = ?'),
   getTxnByOrder: db.prepare('SELECT * FROM transactions WHERE order_number = ?'),
+  getTxnByShopifyId: db.prepare('SELECT * FROM transactions WHERE shopify_order_id = ?'),
   upsertTxn:     db.prepare(`
     INSERT INTO transactions (txn_id, status, shopify_order_id, order_number, amount, currency, till_uuid, purchase_id, redirect_url, till_error, customer_email, updated_at)
     VALUES (@txn_id, @status, @shopify_order_id, @order_number, @amount, @currency, @till_uuid, @purchase_id, @redirect_url, @till_error, @customer_email, datetime('now'))
@@ -398,6 +399,27 @@ function getTransaction(txnId) {
 // Helper: look up transaction by Shopify order_number (for redirect page)
 function getTransactionByOrderNumber(orderNumber) {
   const row = stmts.getTxnByOrder.get(String(orderNumber));
+  if (!row) return null;
+  return {
+    txnId:          row.txn_id,
+    status:         row.status,
+    shopifyOrderId: row.shopify_order_id,
+    orderNumber:    row.order_number,
+    amount:         row.amount,
+    currency:       row.currency,
+    tillUuid:       row.till_uuid,
+    purchaseId:     row.purchase_id,
+    redirectUrl:    row.redirect_url,
+    tillError:      row.till_error,
+    customerEmail:  row.customer_email,
+    createdAt:      row.created_at,
+    updatedAt:      row.updated_at
+  };
+}
+
+// Helper: look up transaction by Shopify order ID (for checkout extension)
+function getTransactionByShopifyOrderId(shopifyOrderId) {
+  const row = stmts.getTxnByShopifyId.get(String(shopifyOrderId));
   if (!row) return null;
   return {
     txnId:          row.txn_id,
@@ -485,6 +507,20 @@ app.use('/api/payment-redirect', (req, res, next) => {
   next();
 });
 
+// Checkout UI Extensions run on Shopify's CDN — allow any origin for this
+// email-verified endpoint so the Thank You page extension can poll it.
+app.use('/api/payment-redirect-by-shopify-id', (req, res, next) => {
+  const origin = req.get('Origin');
+  if (origin) {
+    res.set('Access-Control-Allow-Origin', origin);
+    res.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type');
+    res.set('Access-Control-Max-Age', '86400');
+  }
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 // ── Health check ────────────────────────────────────────────────────────────
 
 app.get('/health', (_req, res) => {
@@ -540,6 +576,60 @@ app.get('/api/payment-redirect/:orderNumber', (req, res) => {
   if (txn.customerEmail && email !== txn.customerEmail.trim().toLowerCase()) {
     // Don't reveal whether the order exists — return not_found
     logger.warn('Payment redirect email mismatch', { orderNumber, provided: email });
+    return res.json({ status: 'not_found' });
+  }
+
+  switch (txn.status) {
+    case 'initiated':
+      if (txn.redirectUrl) {
+        return res.json({ status: 'ready', redirectUrl: txn.redirectUrl });
+      }
+      return res.json({ status: 'pending' });
+
+    case 'pending':
+      return res.json({ status: 'pending' });
+
+    case 'paid':
+      return res.json({ status: 'paid' });
+
+    case 'failed':
+    case 'amount_mismatch':
+    case 'currency_mismatch':
+      return res.json({ status: 'failed', error: txn.tillError || txn.status });
+
+    default:
+      return res.json({ status: 'pending' });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ENDPOINT: GET /api/payment-redirect-by-shopify-id/:shopifyOrderId
+// ═════════════════════════════════════════════════════════════════════════════
+// Same as payment-redirect but looks up by Shopify order ID instead of order number.
+// Used by the checkout extension which only has access to the Shopify GID.
+//
+// Query params:
+//   ?email=customer@example.com   (required — must match order email)
+
+app.get('/api/payment-redirect-by-shopify-id/:shopifyOrderId', (req, res) => {
+  const shopifyOrderId = req.params.shopifyOrderId.trim();
+  const email = (req.query.email || '').trim().toLowerCase();
+
+  if (!email) {
+    return res.json({ status: 'not_found' });
+  }
+
+  const txn = getTransactionByShopifyOrderId(shopifyOrderId);
+
+  logger.info('Payment redirect by Shopify ID lookup', { shopifyOrderId, hasEmail: !!email, found: !!txn });
+
+  if (!txn) {
+    return res.json({ status: 'pending' });
+  }
+
+  // Email verification
+  if (txn.customerEmail && email !== txn.customerEmail.trim().toLowerCase()) {
+    logger.warn('Payment redirect email mismatch (by Shopify ID)', { shopifyOrderId, provided: email });
     return res.json({ status: 'not_found' });
   }
 
