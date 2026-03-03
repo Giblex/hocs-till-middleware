@@ -946,17 +946,27 @@ app.post('/api/till-callback', async (req, res) => {
     } else if (result === 'ERROR') {
       saveTransaction({ txnId, status: 'failed', tillUuid });
       const errorCode = cb.errors?.[0]?.errorCode;
+      const errorMsg  = cb.errors?.[0]?.errorMessage || cb.errors?.[0]?.message || 'unknown';
+      const adapterCode = cb.errors?.[0]?.adapterCode || '';
+      const adapterMsg  = cb.errors?.[0]?.adapterMessage || '';
+
+      logger.error('PAYMENT FAILED DETAILS', {
+        requestId, txnId, tillUuid,
+        errorCode, errorMsg, adapterCode, adapterMsg,
+        fullErrors: JSON.stringify(cb.errors),
+        fullBody: JSON.stringify(cb).substring(0, 1000)
+      });
 
       if (errorCode === 1004) {
-        logger.alert('Till payment error 1004 — check connector/config', { requestId, txnId, errors: cb.errors });
+        logger.alert('Till payment error 1004 — check connector/config', { requestId, txnId, errorMsg, adapterMsg });
       } else if (errorCode === 2003) {
-        logger.alert('Till payment declined (2003)', { requestId, txnId, errors: cb.errors });
+        logger.alert('Till payment declined (2003)', { requestId, txnId, errorMsg, adapterMsg });
       } else if (errorCode === 2021) {
-        logger.alert('Till 3DS verification failed (2021)', { requestId, txnId, errors: cb.errors });
+        logger.alert('Till 3DS verification failed (2021)', { requestId, txnId, errorMsg, adapterMsg });
       } else if (errorCode === 3004) {
-        logger.alert('Till duplicate transaction ID (3004)', { requestId, txnId, errors: cb.errors });
+        logger.alert('Till duplicate transaction ID (3004)', { requestId, txnId, errorMsg, adapterMsg });
       } else {
-        logger.error('Payment failed', { requestId, txnId, result, errors: cb.errors });
+        logger.error('Payment failed — unhandled error code', { requestId, txnId, errorCode, errorMsg, adapterCode, adapterMsg });
       }
 
     } else {
