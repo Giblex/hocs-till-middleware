@@ -87,6 +87,13 @@ for (const key of REQUIRED_ENV) {
   }
 }
 
+// ─── Diagnostic: log env var presence at startup (not values) ───────────────
+console.log('[BOOT] Webhook secret configured:', {
+  SHOPIFY_WEBHOOK_SECRET: SHOPIFY_WEBHOOK_SECRET ? `${SHOPIFY_WEBHOOK_SECRET.substring(0, 6)}...(${SHOPIFY_WEBHOOK_SECRET.length} chars)` : 'UNSET',
+  SHOPIFY_CLIENT_SECRET: SHOPIFY_CLIENT_SECRET ? `${SHOPIFY_CLIENT_SECRET.substring(0, 6)}...(${SHOPIFY_CLIENT_SECRET.length} chars)` : 'UNSET',
+  secretsMatch: SHOPIFY_WEBHOOK_SECRET === SHOPIFY_CLIENT_SECRET,
+});
+
 // ─── Structured Logger (Rec #9) ─────────────────────────────────────────────
 
 const logger = {
@@ -674,13 +681,35 @@ app.post('/api/shopify-webhook', paymentLimiter, async (req, res) => {
       return res.status(401).json({ error: 'Missing HMAC' });
     }
 
-    const computedHmac = crypto
-      .createHmac('sha256', SHOPIFY_WEBHOOK_SECRET)
-      .update(req.rawBody)
-      .digest('base64');
+    // Try SHOPIFY_WEBHOOK_SECRET first, then fall back to SHOPIFY_CLIENT_SECRET
+    // (Shopify signs app-managed webhooks with the client secret)
+    const secrets = [SHOPIFY_WEBHOOK_SECRET, SHOPIFY_CLIENT_SECRET].filter(Boolean);
+    const uniqueSecrets = [...new Set(secrets)];
+    let verified = false;
 
-    if (!crypto.timingSafeEqual(Buffer.from(computedHmac), Buffer.from(hmacHeader))) {
-      logger.alert('Shopify webhook HMAC verification FAILED', { requestId });
+    for (const secret of uniqueSecrets) {
+      const computedHmac = crypto
+        .createHmac('sha256', secret)
+        .update(req.rawBody)
+        .digest('base64');
+
+      if (computedHmac.length === hmacHeader.length &&
+          crypto.timingSafeEqual(Buffer.from(computedHmac), Buffer.from(hmacHeader))) {
+        verified = true;
+        break;
+      }
+    }
+
+    if (!verified) {
+      logger.alert('Shopify webhook HMAC verification FAILED', {
+        requestId,
+        secretLen: SHOPIFY_WEBHOOK_SECRET?.length || 0,
+        secretPrefix: SHOPIFY_WEBHOOK_SECRET?.substring(0, 6) || 'UNSET',
+        clientSecretLen: SHOPIFY_CLIENT_SECRET?.length || 0,
+        clientSecretPrefix: SHOPIFY_CLIENT_SECRET?.substring(0, 6) || 'UNSET',
+        rawBodyLen: req.rawBody?.length || 0,
+        hmacHeaderLen: hmacHeader?.length || 0,
+      });
       return res.status(401).json({ error: 'HMAC verification failed' });
     }
 
