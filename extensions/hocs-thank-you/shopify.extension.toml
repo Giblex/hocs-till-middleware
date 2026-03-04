@@ -1,6 +1,9 @@
-api_version = "2025-01"
+api_version = "2025-04"
 
 [[extensions]]
+
+uid = "2ad4293a-c48b-4db9-3196-d5f07c030a2806d8ad17"
+
 type = "ui_extension"
 name = "HOCS Payment Redirect"
 handle = "hocs-payment-redirect"
@@ -10,8 +13,5 @@ handle = "hocs-payment-redirect"
   module = "./src/ThankYouPayment.jsx"
 
 [extensions.capabilities]
+# network_access lets the extension fetch from external domains
 network_access = true
-
-# Allow the extension to call our Railway middleware
-[[extensions.capabilities.network_access.allowed_domains]]
-host = "hocs-till-middleware-production.up.railway.app"

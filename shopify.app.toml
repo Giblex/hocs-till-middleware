@@ -3,12 +3,18 @@
 
 name = "HOCS Middleware"
 client_id = "0572f3c0994e7a23958e710689979129"
+application_url = "https://hocs-till-middleware-production.up.railway.app"
+embedded = false
 
 [access_scopes]
 scopes = "write_orders,read_orders"
 
 [auth]
-redirect_urls = []
+redirect_urls = ["https://hocs-till-middleware-production.up.railway.app/api/auth/callback"]
 
 [webhooks]
-api_version = "2025-01"
+api_version = "2025-04"
+
+  [[webhooks.subscriptions]]
+  topics = ["orders/create"]
+  uri = "/api/shopify-webhook"

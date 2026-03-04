@@ -6,9 +6,7 @@
   "dependencies": {
     "@shopify/ui-extensions-react": "2025.1.x",
     "@shopify/ui-extensions": "2025.1.x",
-    "react": "^18.0.0"
-  },
-  "devDependencies": {
-    "@shopify/ui-extensions-dev-console": "latest"
+    "react": "^18.0.0",
+    "react-reconciler": "^0.29.0"
   }
 }
