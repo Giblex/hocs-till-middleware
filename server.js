@@ -750,7 +750,7 @@ app.post('/api/shopify-webhook', paymentLimiter, async (req, res) => {
         channel:                         '02',       // Browser-based (BRW)
         authenticationIndicator:         '01',       // Payment transaction
         cardholderAuthenticationMethod:  '01',       // No cardholder authentication
-        challengePreference:             '02'        // Challenge requested
+        challengeIndicator:              '02'        // Challenge requested
       }
     };
 
