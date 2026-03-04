@@ -51,6 +51,7 @@ const {
   SHOPIFY_CLIENT_ID,               // Client ID from Dev Dashboard → Settings
   SHOPIFY_CLIENT_SECRET,           // Client Secret from Dev Dashboard → Settings
   SHOPIFY_WEBHOOK_SECRET,          // HMAC secret for verifying Shopify webhooks
+  SHOPIFY_STORE_WEBHOOK_SECRET,    // Optional: store-level webhook signing key (Admin → Settings → Notifications)
 
   // URLs
   TILL_BASE_URL         = 'https://test-gateway.tillpayments.com', // Sandbox (default safe)
@@ -91,7 +92,9 @@ for (const key of REQUIRED_ENV) {
 console.log('[BOOT] Webhook secret configured:', {
   SHOPIFY_WEBHOOK_SECRET: SHOPIFY_WEBHOOK_SECRET ? `${SHOPIFY_WEBHOOK_SECRET.substring(0, 6)}...(${SHOPIFY_WEBHOOK_SECRET.length} chars)` : 'UNSET',
   SHOPIFY_CLIENT_SECRET: SHOPIFY_CLIENT_SECRET ? `${SHOPIFY_CLIENT_SECRET.substring(0, 6)}...(${SHOPIFY_CLIENT_SECRET.length} chars)` : 'UNSET',
+  SHOPIFY_STORE_WEBHOOK_SECRET: SHOPIFY_STORE_WEBHOOK_SECRET ? `${SHOPIFY_STORE_WEBHOOK_SECRET.substring(0, 6)}...(${SHOPIFY_STORE_WEBHOOK_SECRET.length} chars)` : 'UNSET',
   secretsMatch: SHOPIFY_WEBHOOK_SECRET === SHOPIFY_CLIENT_SECRET,
+  uniqueSecrets: [...new Set([SHOPIFY_WEBHOOK_SECRET, SHOPIFY_CLIENT_SECRET, SHOPIFY_STORE_WEBHOOK_SECRET].filter(Boolean))].length,
 });
 
 // ─── Structured Logger (Rec #9) ─────────────────────────────────────────────
@@ -681,9 +684,11 @@ app.post('/api/shopify-webhook', paymentLimiter, async (req, res) => {
       return res.status(401).json({ error: 'Missing HMAC' });
     }
 
-    // Try SHOPIFY_WEBHOOK_SECRET first, then fall back to SHOPIFY_CLIENT_SECRET
-    // (Shopify signs app-managed webhooks with the client secret)
-    const secrets = [SHOPIFY_WEBHOOK_SECRET, SHOPIFY_CLIENT_SECRET].filter(Boolean);
+    // Try all configured secrets:
+    // 1. SHOPIFY_WEBHOOK_SECRET (explicit webhook secret)
+    // 2. SHOPIFY_CLIENT_SECRET (app-managed webhooks use client secret)
+    // 3. SHOPIFY_STORE_WEBHOOK_SECRET (store-level admin webhooks use a different key)
+    const secrets = [SHOPIFY_WEBHOOK_SECRET, SHOPIFY_CLIENT_SECRET, SHOPIFY_STORE_WEBHOOK_SECRET].filter(Boolean);
     const uniqueSecrets = [...new Set(secrets)];
     let verified = false;
 
@@ -703,10 +708,17 @@ app.post('/api/shopify-webhook', paymentLimiter, async (req, res) => {
     if (!verified) {
       logger.alert('Shopify webhook HMAC verification FAILED', {
         requestId,
+        shopifyWebhookId: req.get('X-Shopify-Webhook-Id') || 'missing',
+        shopifyTopic: req.get('X-Shopify-Topic') || 'missing',
+        shopifyApiVersion: req.get('X-Shopify-Api-Version') || 'missing',
+        shopifyTriggeredAt: req.get('X-Shopify-Triggered-At') || 'missing',
         secretLen: SHOPIFY_WEBHOOK_SECRET?.length || 0,
         secretPrefix: SHOPIFY_WEBHOOK_SECRET?.substring(0, 6) || 'UNSET',
         clientSecretLen: SHOPIFY_CLIENT_SECRET?.length || 0,
         clientSecretPrefix: SHOPIFY_CLIENT_SECRET?.substring(0, 6) || 'UNSET',
+        storeSecretLen: SHOPIFY_STORE_WEBHOOK_SECRET?.length || 0,
+        storeSecretPrefix: SHOPIFY_STORE_WEBHOOK_SECRET?.substring(0, 6) || 'UNSET',
+        secretsTriedCount: uniqueSecrets.length,
         rawBodyLen: req.rawBody?.length || 0,
         hmacHeaderLen: hmacHeader?.length || 0,
       });
