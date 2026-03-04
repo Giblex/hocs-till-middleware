@@ -740,12 +740,17 @@ app.post('/api/shopify-webhook', paymentLimiter, async (req, res) => {
       customer:    tillCustomer,
       language:    'en',
       transactionIndicator: 'SINGLE',
+      // extraData is Till's primary flag for enforcing 3DS at the gateway level.
+      // Without this, Till may not mandate 3DS even if threeDSecureData is present.
+      extraData: {
+        '3dsecure': 'MANDATORY'
+      },
       threeDSecureData: {
         '3dsecure':                      'MANDATORY',
-        channel:                         '02',       // Browser-based
+        channel:                         '02',       // Browser-based (BRW)
         authenticationIndicator:         '01',       // Payment transaction
-        cardholderAuthenticationMethod:  '01',       // No authentication
-        challengeIndicator:              '02'        // Challenge requested (mandate for high-risk)
+        cardholderAuthenticationMethod:  '01',       // No cardholder authentication
+        challengePreference:             '02'        // Challenge requested
       }
     };
 
@@ -925,11 +930,29 @@ app.post('/api/till-callback', async (req, res) => {
     }
 
     // ── 5. Process based on result ───────────────────────────────────────
-    if (result === 'OK' && (returnType === 'FINISHED' || returnType === 'REDIRECT')) {
+    //
+    // returnType values from Till:
+    //   'FINISHED' = payment complete, card was charged — mark order paid
+    //   'REDIRECT' = hosted payment page is ready; customer still needs to pay — do NOT mark paid
+    //   'ERROR'    = payment failed
+    //
+    // IMPORTANT: 'REDIRECT' must NOT trigger markShopifyOrderPaid.
+    // Till sends a REDIRECT callback when the debit is initiated and a hosted
+    // payment page URL is generated. The redirect URL is already saved to the
+    // DB during the Shopify webhook handler. There is nothing to do here.
+    if (returnType === 'REDIRECT') {
+      logger.info('Till REDIRECT callback received — hosted payment page ready, awaiting customer payment', {
+        requestId, txnId, tillUuid
+      });
+      // No action needed — redirectUrl already stored; customer will complete payment on Till's page.
+      return res.status(200).send('OK');
+    }
+
+    if (result === 'OK' && returnType === 'FINISHED') {
       // Payment succeeded — mark Shopify order as paid
       logger.info('Payment successful — marking Shopify order paid', { requestId, txnId });
 
-      const markResult = await markShopifyOrderPaid(original.shopifyOrderId, tillUuid, txnId);
+      const markResult = await markShopifyOrderPaid(original.shopifyOrderId, tillUuid, txnId, original.amount);
 
       if (markResult.success) {
         saveTransaction({ txnId, status: 'paid', tillUuid });
@@ -985,16 +1008,18 @@ app.post('/api/till-callback', async (req, res) => {
 
 // ─── Mark Shopify Order as Paid ─────────────────────────────────────────────
 // Uses Shopify Admin API to create a transaction marking the order as paid.
+// kind:'sale' is correct for externally-processed payments — 'capture' requires
+// a prior Shopify authorization which doesn't exist here (Till handled payment).
 
-async function markShopifyOrderPaid(shopifyOrderId, tillUuid, txnId) {
+async function markShopifyOrderPaid(shopifyOrderId, tillUuid, txnId, amount) {
   try {
     // Create a transaction to mark the order paid
     const transactionPayload = {
       transaction: {
-        kind:     'capture',
-        status:   'success',
-        // amount omitted — Shopify uses order total automatically
-        gateway:  'Till Payments (PayNuts)',
+        kind:      'sale',
+        status:    'success',
+        amount:    amount,           // Explicit amount from original order
+        gateway:   'Till Payments (PayNuts)',
         authorization: tillUuid || txnId
       }
     };
