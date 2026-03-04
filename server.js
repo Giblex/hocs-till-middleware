@@ -589,6 +589,14 @@ app.get('/api/payment-redirect/:orderNumber', (req, res) => {
     return res.json({ status: 'not_found' });
   }
 
+  logger.info('Payment redirect — returning status', {
+    orderNumber,
+    txnId,
+    txnStatus: txn.status,
+    hasRedirectUrl: !!txn.redirectUrl,
+    redirectUrlPrefix: txn.redirectUrl ? txn.redirectUrl.substring(0, 100) : null,
+  });
+
   switch (txn.status) {
     case 'initiated':
       if (txn.redirectUrl) {
@@ -817,6 +825,15 @@ app.post('/api/shopify-webhook', paymentLimiter, async (req, res) => {
       const tillUuid    = tillRes.body.uuid;
       const purchaseId = tillRes.body.purchaseId;
       const redirectUrl = tillRes.body.redirectUrl;
+      const returnType  = tillRes.body.returnType;
+
+      logger.info('Till debit response details', {
+        requestId, txnId, tillUuid, purchaseId,
+        returnType,
+        hasRedirectUrl: !!redirectUrl,
+        redirectUrlPrefix: redirectUrl ? redirectUrl.substring(0, 100) : null,
+        successUrl: SUCCESS_URL,
+      });
 
       saveTransaction({
         txnId,
