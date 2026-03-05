@@ -501,8 +501,7 @@ const paymentLimiter = rateLimit({
 const ALLOWED_ORIGINS = [
   'https://highonchapel.com',
   'https://www.highonchapel.com',
-  'https://highonchapel.myshopify.com',
-  'https://hocdev.myshopify.com'
+  'https://highonchapel.myshopify.com'
 ];
 
 app.use('/api/payment-redirect', (req, res, next) => {

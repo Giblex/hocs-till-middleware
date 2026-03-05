@@ -19,7 +19,7 @@ import {
 } from '@shopify/ui-extensions-react/checkout';
 
 const MIDDLEWARE_URL = 'https://hocs-till-middleware-production.up.railway.app';
-const STORE_URL = 'https://hocdev.myshopify.com';
+const STORE_URL = 'https://highonchapel.com';
 const POLL_INTERVAL = 2500;
 const MAX_POLLS = 24; // 24 × 2.5s = 60 seconds
 
