@@ -1119,7 +1119,7 @@ button.danger:hover{background:#b91c1c}
     <option value="INITIAL">1.a – Initial (with Register)</option>
     <option value="RECURRING">1.b – Recurring</option>
     <option value="CARDONFILE">1.c – Card on File</option>
-    <option value="CARDONFILE_MERCHANT_INITIATED">1.d – Card on File Merchant Init</option>
+    <option value="CARDONFILE_MERCHANT_INIT">1.d – Card on File Merchant Init</option>
   </select>
   <label>3DS Mode</label>
   <select id="d-3ds">
@@ -1149,7 +1149,7 @@ button.danger:hover{background:#b91c1c}
     <option value="INITIAL">2.a – Initial (with Register)</option>
     <option value="RECURRING">2.b – Recurring</option>
     <option value="CARDONFILE">2.c – Card on File</option>
-    <option value="CARDONFILE_MERCHANT_INITIATED">2.d – Card on File Merchant Init</option>
+    <option value="CARDONFILE_MERCHANT_INIT">2.d – Card on File Merchant Init</option>
   </select>
   <label>3DS Mode</label>
   <select id="p-3ds">
