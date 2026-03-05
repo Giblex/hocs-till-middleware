@@ -1399,9 +1399,7 @@ function buildPayload(body, extra = {}) {
     payload.registrationId = registrationId;
   }
 
-  if (descriptor) {
-    payload.descriptor = descriptor;
-  }
+  // descriptor is already mapped to payload.description above — do not also send as 'descriptor'
 
   return payload;
 }
