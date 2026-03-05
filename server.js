@@ -1403,14 +1403,12 @@ function buildPayload(body, extra = {}) {
     ...extra
   };
 
-  // Include card data if supplied (PAN path)
+  // Include card data if supplied — Till API v3 requires top-level fields, NOT nested under "card"
   if (pan) {
-    payload.card = {
-      pan,
-      expiryMonth,
-      expiryYear,
-      cvv
-    };
+    payload.pan         = pan;
+    payload.expiryMonth = expiryMonth;
+    payload.expiryYear  = expiryYear;
+    payload.cvv         = cvv;
   }
 
   // Include registrationId for recurring / card-on-file tests
@@ -1512,7 +1510,7 @@ app.post('/api/till/register', paymentLimiter, async (req, res) => {
         ipAddress:      '127.0.0.1',
         billingCountry: 'AU'
       },
-      ...(pan ? { card: { pan, expiryMonth, expiryYear, cvv } } : {})
+      ...(pan ? { pan, expiryMonth, expiryYear, cvv } : {})
     };
     const result = await callTillAPI('POST', `/api/v3/transaction/${TILL_API_KEY}/register`, payload);
     logger.info('[CERT] Register', { txnId: payload.merchantTransactionId, status: result.status });
