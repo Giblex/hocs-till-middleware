@@ -1110,9 +1110,7 @@ button.danger:hover{background:#b91c1c}
 <!-- ── CARD 1: Debit ─────────────────────────────────── -->
 <div class="card">
   <h2>Tests 1.a–1.h · Debit</h2>
-  <label>Card Number</label><input id="d-card" value="4111111111111111">
-  <label>Exp MM/YY</label><input id="d-exp" value="12/25" placeholder="12/25">
-  <label>CVV</label><input id="d-cvv" value="123">
+  <p class="tip" style="margin-bottom:8px;color:#fbbf24">Till returns a <strong>redirectUrl</strong> — open it to enter your test card on Till's hosted page.</p>
   <label>Amount</label><input id="d-amount" value="1.00">
   <label>Currency</label><input id="d-cur" value="AUD">
   <label>Transaction Indicator</label>
@@ -1142,9 +1140,7 @@ button.danger:hover{background:#b91c1c}
 <!-- ── CARD 2: Preauth ──────────────────────────────── -->
 <div class="card">
   <h2>Tests 2.a–2.h · Preauth</h2>
-  <label>Card Number</label><input id="p-card" value="4111111111111111">
-  <label>Exp MM/YY</label><input id="p-exp" value="12/25">
-  <label>CVV</label><input id="p-cvv" value="123">
+  <p class="tip" style="margin-bottom:8px;color:#fbbf24">Till returns a <strong>redirectUrl</strong> — open it to enter your test card on Till's hosted page.</p>
   <label>Amount</label><input id="p-amount" value="1.00">
   <label>Currency</label><input id="p-cur" value="AUD">
   <label>Transaction Indicator</label>
@@ -1190,9 +1186,7 @@ button.danger:hover{background:#b91c1c}
 <!-- ── CARD 5: Register & Deregister ─────────────────── -->
 <div class="card">
   <h2>Test 5 · Register &nbsp;&nbsp; Test 5.a · Deregister</h2>
-  <label>Card Number</label><input id="r-card" value="4111111111111111">
-  <label>Exp MM/YY</label><input id="r-exp" value="12/25">
-  <label>CVV</label><input id="r-cvv" value="123">
+  <p class="tip" style="margin-bottom:8px;color:#fbbf24">Till returns a <strong>redirectUrl</strong> — open it to enter your test card on Till's hosted page.</p>
   <label>Customer Email</label><input id="r-email" value="test@highonchapel.com">
   <label>Merchant Txn ID (auto if blank)</label>
   <input id="r-txnid" placeholder="auto">
@@ -1237,10 +1231,7 @@ button.danger:hover{background:#b91c1c}
 <!-- ── CARD 10: Negative Tests ───────────────────────── -->
 <div class="card">
   <h2>Test 10 · Negative (Declined) Transactions</h2>
-  <p class="tip" style="margin-bottom:8px">Use decline card: 4111 1111 1111 1119</p>
-  <label>Card Number (use a decline card)</label><input id="neg-card" value="4111111111111119">
-  <label>Exp MM/YY</label><input id="neg-exp" value="12/25">
-  <label>CVV</label><input id="neg-cvv" value="123">
+  <p class="tip" style="margin-bottom:8px">Click run — Till returns a redirectUrl. On Till's hosted page, use decline card: <strong style="color:#fbbf24">4111 1111 1111 1119</strong></p>
   <label>Amount</label><input id="neg-amount" value="1.00">
   <label>Currency</label><input id="neg-cur" value="AUD">
   <label>Test type</label>
@@ -1262,31 +1253,29 @@ function show(id, data){
   el.style.display='block';
   const ok = data.success !== false && !data.error;
   el.className = 'response ' + (ok ? 'ok' : 'err');
-  el.textContent = JSON.stringify(data, null, 2);
+  // Show redirect URL as a prominent clickable link
+  let extra = '';
+  if (data.redirectUrl) {
+    extra = '<div style="margin-bottom:8px"><a href="'+data.redirectUrl+'" target="_blank" style="display:inline-block;background:#15803d;color:#fff;padding:8px 16px;border-radius:6px;text-decoration:none;font-weight:700;font-size:12px">🔗 Open Payment Page →</a><br><span style="font-size:10px;color:#94a3b8;word-break:break-all">'+data.redirectUrl+'</span></div>';
+  }
+  el.innerHTML = extra + '<pre style="margin:0">'+JSON.stringify(data, null, 2)+'</pre>';
 }
 async function post(url, body){
   const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   return r.json();
 }
 
-function parsedCard(card, exp, cvv){
-  const [mm, yy] = (exp||'').split('/');
-  return { pan: card.replace(/\\s/g,''), expiryMonth: mm, expiryYear: yy && yy.length===2 ? '20'+yy : yy, cvv };
-}
-
 async function runDebit(){
-  const c = parsedCard(d('d-card'), d('d-exp'), d('d-cvv'));
   const ind = d('d-indicator'), ds = d('d-3ds'), desc = d('d-descriptor'), regId = d('d-regid');
-  const body = { ...c, amount: d('d-amount'), currency: d('d-cur'), transactionIndicator: ind,
+  const body = { amount: d('d-amount'), currency: d('d-cur'), transactionIndicator: ind,
     threeDSMode: ds, merchantTransactionId: d('d-txnid') || uid(),
     descriptor: desc || undefined, registrationId: regId || undefined };
   show('d-resp', await post('/api/till/debit', body));
 }
 
 async function runPreauth(){
-  const c = parsedCard(d('p-card'), d('p-exp'), d('p-cvv'));
   const ind = d('p-indicator'), ds = d('p-3ds'), desc = d('p-descriptor'), regId = d('p-regid');
-  const body = { ...c, amount: d('p-amount'), currency: d('p-cur'), transactionIndicator: ind,
+  const body = { amount: d('p-amount'), currency: d('p-cur'), transactionIndicator: ind,
     threeDSMode: ds, merchantTransactionId: d('p-txnid') || uid(),
     descriptor: desc || undefined, registrationId: regId || undefined };
   show('p-resp', await post('/api/till/preauth', body));
@@ -1304,9 +1293,8 @@ async function runVoid(){
 }
 
 async function runRegister(){
-  const c = parsedCard(d('r-card'), d('r-exp'), d('r-cvv'));
   show('r-resp', await post('/api/till/register', {
-    ...c, email: d('r-email'), merchantTransactionId: d('r-txnid') || uid()
+    email: d('r-email'), merchantTransactionId: d('r-txnid') || uid()
   }));
 }
 
@@ -1331,9 +1319,8 @@ async function runIncremental(){
 }
 
 async function runNegative(){
-  const c = parsedCard(d('neg-card'), d('neg-exp'), d('neg-cvv'));
   const type = d('neg-type');
-  const body = { ...c, amount: d('neg-amount'), currency: d('neg-cur'),
+  const body = { amount: d('neg-amount'), currency: d('neg-cur'),
     transactionIndicator: 'SINGLE', threeDSMode: 'NONE',
     merchantTransactionId: uid(), email: 'test@highonchapel.com' };
   let url = type === 'debit' ? '/api/till/debit' : type === 'preauth' ? '/api/till/preauth' : '/api/till/register';
@@ -1403,13 +1390,9 @@ function buildPayload(body, extra = {}) {
     ...extra
   };
 
-  // Include card data if supplied — Till API v3 requires top-level fields, NOT nested under "card"
-  if (pan) {
-    payload.pan         = pan;
-    payload.expiryMonth = expiryMonth;
-    payload.expiryYear  = expiryYear;
-    payload.cvv         = cvv;
-  }
+  // NOTE: Till sandbox uses a hosted payment page (HPP) — raw card data is NOT sent via API.
+  // Cards are entered by the user on Till's hosted page after following the redirectUrl.
+  // Test 1.i (PCI Direct API) requires separate PCI DSS certification and is excluded here.
 
   // Include registrationId for recurring / card-on-file tests
   if (registrationId) {
@@ -1510,7 +1493,7 @@ app.post('/api/till/register', paymentLimiter, async (req, res) => {
         ipAddress:      '127.0.0.1',
         billingCountry: 'AU'
       },
-      ...(pan ? { pan, expiryMonth, expiryYear, cvv } : {})
+      // No raw card data — Till sandbox uses hosted payment page flow
     };
     const result = await callTillAPI('POST', `/api/v3/transaction/${TILL_API_KEY}/register`, payload);
     logger.info('[CERT] Register', { txnId: payload.merchantTransactionId, status: result.status });
