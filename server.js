@@ -1076,7 +1076,7 @@ app.get('/api/cert/run-all', async (_req, res) => {
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
   async function run(label, method, path, body = {}) {
-    await sleep(2000); // throttle: Till sandbox rate limit (1009)
+    await sleep(4000); // throttle: Till sandbox rate limit (~10 req/30s)
     try {
       const r = await callTillAPI(method, path, body);
       const d = r.body || {};
@@ -1329,7 +1329,7 @@ function renderAll(results){
 async function runAll(){
   const btn = document.getElementById('run-btn');
   btn.disabled=true; btn.textContent='Running…';
-  setStatus('Calling Till API for all 28 tests… ~60 seconds (throttled to avoid rate limit).');
+  setStatus('Calling Till API for all 28 tests… ~2 minutes (throttled to avoid rate limit).');
   try {
     const resp = await fetch('/api/cert/run-all');
     const data = await resp.json();
