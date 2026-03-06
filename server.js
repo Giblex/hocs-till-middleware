@@ -1252,13 +1252,16 @@ function renderRow(r, idx){
   const redir   = r.redirectUrl || '';
   const success = r.success;
   const isHPP   = !!redir;
-  const errInfo = r.raw?.errors?.[0] ? \`\${r.raw.errors[0].errorCode}: \${r.raw.errors[0].errorMessage||r.raw.errors[0].message||''}\` : (r.raw?.error || '');
+  const errInfo = r.raw?.errors?.[0]
+    ? \`\${r.raw.errors[0].errorCode}: \${r.raw.errors[0].errorMessage||r.raw.errors[0].message||''}\`
+    : (r.raw?.errorMessage ? \`\${r.raw.errorCode ? r.raw.errorCode+': ' : ''}\${r.raw.errorMessage}\` : (r.raw?.error || ''));
   const needsHPP = r.label.includes('needs HPP');
   
+  const rawSummary = JSON.stringify(r.raw || {}).substring(0, 300).replace(/'/g, '&apos;').replace(/"/g, '&quot;');
   let statusBadge;
   if (needsHPP && !success){ statusBadge = '<span class="badge pending">PENDING HPP</span>'; }
   else if (success){ statusBadge = '<span class="badge ok">OK</span>'; }
-  else { statusBadge = '<span class="badge err">ERROR</span>'; }
+  else { statusBadge = \`<span class="badge err" title="\${rawSummary}">ERROR ⓘ</span>\`; }
 
   const uuidHtml = uuid
     ? \`<span>\${uuid}</span><button class="copy-btn" onclick="copyText('\${uuid}')">copy</button>\`
