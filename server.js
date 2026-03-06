@@ -1096,12 +1096,12 @@ app.get('/api/cert/run-all', async (_req, res) => {
 
   // ── Test 1.a — INITIAL debit (starts registration, returns registrationId)
   const d_1a = await run('1.a – Debit INITIAL',              'POST', BASE+'/debit',       { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'INITIAL', description:'HOC Cert 1.a', customer:CUST, ...URLS });
-  const regIdFromDebit = d_1a.uuid || d_1a.raw?.registrationId || null;
+  const refUuidFromDebit = d_1a.uuid || null;
 
-  // ── Tests 1.b/1.c/1.d — card-on-file debits (use registrationId from 1.a)
-  const d_1b = await run('1.b – Debit RECURRING',                 'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'RECURRING',                    description:'HOC Cert 1.b', customer:CUST, ...URLS, ...(regIdFromDebit ? {registrationId:regIdFromDebit}:{}) });
-  const d_1c = await run('1.c – Debit CARDONFILE',                'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE',                   description:'HOC Cert 1.c', customer:CUST, ...URLS, ...(regIdFromDebit ? {registrationId:regIdFromDebit}:{}) });
-  const d_1d = await run('1.d – Debit CARDONFILE-MERCHANT-INIT',  'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE-MERCHANT-INITIATED', description:'HOC Cert 1.d', customer:CUST, ...URLS, ...(regIdFromDebit ? {registrationId:regIdFromDebit}:{}) });
+  // ── Tests 1.b/1.c/1.d — card-on-file debits (referenceUuid = UUID from 1.a INITIAL)
+  const d_1b = await run('1.b – Debit RECURRING',                 'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'RECURRING',                    description:'HOC Cert 1.b', customer:CUST, ...URLS, ...(refUuidFromDebit ? {referenceUuid:refUuidFromDebit}:{}) });
+  const d_1c = await run('1.c – Debit CARDONFILE',                'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE',                   description:'HOC Cert 1.c', customer:CUST, ...URLS, ...(refUuidFromDebit ? {referenceUuid:refUuidFromDebit}:{}) });
+  const d_1d = await run('1.d – Debit CARDONFILE-MERCHANT-INIT',  'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE-MERCHANT-INITIATED', description:'HOC Cert 1.d', customer:CUST, ...URLS, ...(refUuidFromDebit ? {referenceUuid:refUuidFromDebit}:{}) });
 
   results.push(d_1a, d_1b, d_1c, d_1d, d_1e, d_1f, d_1g, d_1h);
 
@@ -1111,10 +1111,10 @@ app.get('/api/cert/run-all', async (_req, res) => {
   const p_2h = await run('2.h – Preauth SINGLE 3DS OPTIONAL', 'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'HOC Cert 2.h', customer:CUST, ...URLS, extraData:{'3dsecure':'OPTIONAL'}, threeDSecureData:{'3dsecure':'OPTIONAL',channel:'02',authenticationIndicator:'01',cardholderAuthenticationMethod:'01',challengeIndicator:'03'} });
   const p_2f = await run('2.f – Preauth SINGLE Dynamic Desc', 'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'High on Chapel 13-Feb', customer:CUST, ...URLS });
   const p_2a = await run('2.a – Preauth INITIAL',              'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'INITIAL', description:'HOC Cert 2.a', customer:CUST, ...URLS });
-  const regIdFromPreauth = p_2a.uuid || p_2a.raw?.registrationId || null;
-  const p_2b = await run('2.b – Preauth RECURRING',                 'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'RECURRING',                    description:'HOC Cert 2.b', customer:CUST, ...URLS, ...(regIdFromPreauth ? {registrationId:regIdFromPreauth}:{}) });
-  const p_2c = await run('2.c – Preauth CARDONFILE',                'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE',                   description:'HOC Cert 2.c', customer:CUST, ...URLS, ...(regIdFromPreauth ? {registrationId:regIdFromPreauth}:{}) });
-  const p_2d = await run('2.d – Preauth CARDONFILE-MERCHANT-INIT',  'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE-MERCHANT-INITIATED', description:'HOC Cert 2.d', customer:CUST, ...URLS, ...(regIdFromPreauth ? {registrationId:regIdFromPreauth}:{}) });
+  const refUuidFromPreauth = p_2a.uuid || null;
+  const p_2b = await run('2.b – Preauth RECURRING',                 'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'RECURRING',                    description:'HOC Cert 2.b', customer:CUST, ...URLS, ...(refUuidFromPreauth ? {referenceUuid:refUuidFromPreauth}:{}) });
+  const p_2c = await run('2.c – Preauth CARDONFILE',                'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE',                   description:'HOC Cert 2.c', customer:CUST, ...URLS, ...(refUuidFromPreauth ? {referenceUuid:refUuidFromPreauth}:{}) });
+  const p_2d = await run('2.d – Preauth CARDONFILE-MERCHANT-INIT',  'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE-MERCHANT-INITIATED', description:'HOC Cert 2.d', customer:CUST, ...URLS, ...(refUuidFromPreauth ? {referenceUuid:refUuidFromPreauth}:{}) });
 
   results.push(p_2a, p_2b, p_2c, p_2d, p_2e, p_2f, p_2g, p_2h);
 
