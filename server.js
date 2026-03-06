@@ -1076,11 +1076,11 @@ app.get('/api/cert/run-all', async (_req, res) => {
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
   async function run(label, method, path, body = {}) {
-    await sleep(400); // throttle: Till sandbox rate limit (1009)
+    await sleep(1000); // throttle: Till sandbox rate limit (1009)
     try {
       const r = await callTillAPI(method, path, body);
       const d = r.body || {};
-      return { label, success: d.success !== false && !d.errors, uuid: d.uuid || d.registrationId || null, redirectUrl: d.redirectUrl || null, raw: d };
+      return { label, success: d.success !== false && !(d.errors && d.errors.length), uuid: d.uuid || d.registrationId || null, redirectUrl: d.redirectUrl || null, raw: d };
     } catch (e) {
       return { label, success: false, uuid: null, redirectUrl: null, raw: { error: e.message } };
     }
@@ -1329,7 +1329,7 @@ function renderAll(results){
 async function runAll(){
   const btn = document.getElementById('run-btn');
   btn.disabled=true; btn.textContent='Running…';
-  setStatus('Calling Till API for all 28 tests… ~20 seconds (throttled to avoid rate limit).');
+  setStatus('Calling Till API for all 28 tests… ~35 seconds (throttled to avoid rate limit).');
   try {
     const resp = await fetch('/api/cert/run-all');
     const data = await resp.json();
