@@ -1258,6 +1258,61 @@ app.get('/cert-error', (_req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
+// ENDPOINT: GET /api/cert/hpp-debug
+// ═════════════════════════════════════════════════════════════════════════════
+// Diagnostic: create a throwaway debit, fetch the HPP page, return raw HTML analysis.
+app.get('/api/cert/hpp-debug', async (_req, res) => {
+  try {
+    const ts = `HPP-DEBUG-${Date.now()}`;
+    const BASE = `/api/v3/transaction/${TILL_API_KEY}`;
+    const r = await callTillAPI('POST', BASE + '/debit', {
+      merchantTransactionId: ts, amount: '1.00', currency: 'AUD',
+      transactionIndicator: 'SINGLE', description: 'HPP Debug Test',
+      customer: { firstName: 'Test', lastName: 'Debug', email: 'debug@test.com', ipAddress: '127.0.0.1', billingCountry: 'AU' },
+      successUrl: CERT_SUCCESS_URL, cancelUrl: CERT_CANCEL_URL, errorUrl: CERT_ERROR_URL, callbackUrl: CALLBACK_URL
+    });
+    const d = r.body || {};
+    if (!d.redirectUrl) return res.json({ error: 'No redirectUrl', raw: d });
+
+    const resp = await fetch(d.redirectUrl, {
+      redirect: 'follow',
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120', 'Accept': 'text/html,*/*' }
+    });
+    const html = await resp.text();
+    const landedUrl = resp.url;
+
+    // Analyse
+    const forms = [];
+    const formRe = /<form([^>]*)>([\s\S]*?)<\/form>/gi;
+    let m;
+    while ((m = formRe.exec(html)) !== null) {
+      const inputs = [];
+      const inpRe2 = /<input\s+([^>]*?)\/?>/gi;
+      let im;
+      while ((im = inpRe2.exec(m[2])) !== null) {
+        const nm = (im[1].match(/name=["']([^"']*)/i) || [])[1] || '(no name)';
+        const tp = (im[1].match(/type=["']([^"']*)/i) || [])[1] || 'text';
+        inputs.push({ name: nm, type: tp });
+      }
+      forms.push({ attrs: m[1].substring(0, 200), inputCount: inputs.length, inputs });
+    }
+
+    res.json({
+      redirectUrl: d.redirectUrl,
+      landedUrl,
+      status: resp.status,
+      htmlLength: html.length,
+      htmlFirst3000: html.substring(0, 3000),
+      htmlLast1000: html.substring(html.length - 1000),
+      formsFound: forms.length,
+      forms
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
 // ENDPOINT: GET /api/cert/run-all
 // ═════════════════════════════════════════════════════════════════════════════
 // Runs ALL certification API calls automatically and returns results as JSON.
