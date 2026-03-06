@@ -1076,7 +1076,7 @@ app.get('/api/cert/run-all', async (_req, res) => {
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
   async function run(label, method, path, body = {}) {
-    await sleep(6000); // throttle: Till sandbox rate limit (~10 req/30s)
+    await sleep(8000); // throttle: Till sandbox rate limit (~5 req/30s, need ≤4 per 30s window)
     try {
       const r = await callTillAPI(method, path, body);
       const d = r.body || {};
@@ -1104,6 +1104,8 @@ app.get('/api/cert/run-all', async (_req, res) => {
   const d_1b = await run('1.b – Debit RECURRING',                 'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'RECURRING',                    description:'HOC Cert 1.b', customer:CUST, callbackUrl: CALLBACK_URL, ...(refUuidFromDebit ? {referenceUuid:refUuidFromDebit}:{}) });
   const d_1c = await run('1.c – Debit CARDONFILE',                'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE',                   description:'HOC Cert 1.c', customer:CUST, callbackUrl: CALLBACK_URL, ...(refUuidFromDebit ? {referenceUuid:refUuidFromDebit}:{}) });
   const d_1d = await run('1.d – Debit CARDONFILE-MERCHANT-INIT',  'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE-MERCHANT-INITIATED', description:'HOC Cert 1.d', customer:CUST, callbackUrl: CALLBACK_URL, ...(refUuidFromDebit ? {referenceUuid:refUuidFromDebit}:{}) });
+  // These three will fail (1006) until the user completes HPP on 1.a — mark as HPP-dependent
+  d_1b.needsHPP = true; d_1c.needsHPP = true; d_1d.needsHPP = true;
 
   results.push(d_1a, d_1b, d_1c, d_1d, d_1e, d_1f, d_1g, d_1h);
 
@@ -1117,6 +1119,8 @@ app.get('/api/cert/run-all', async (_req, res) => {
   const p_2b = await run('2.b – Preauth RECURRING',                 'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'RECURRING',                    description:'HOC Cert 2.b', customer:CUST, callbackUrl: CALLBACK_URL, ...(refUuidFromPreauth ? {referenceUuid:refUuidFromPreauth}:{}) });
   const p_2c = await run('2.c – Preauth CARDONFILE',                'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE',                   description:'HOC Cert 2.c', customer:CUST, callbackUrl: CALLBACK_URL, ...(refUuidFromPreauth ? {referenceUuid:refUuidFromPreauth}:{}) });
   const p_2d = await run('2.d – Preauth CARDONFILE-MERCHANT-INIT',  'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE-MERCHANT-INITIATED', description:'HOC Cert 2.d', customer:CUST, callbackUrl: CALLBACK_URL, ...(refUuidFromPreauth ? {referenceUuid:refUuidFromPreauth}:{}) });
+  // These three will fail (1006) until the user completes HPP on 2.a — mark as HPP-dependent
+  p_2b.needsHPP = true; p_2c.needsHPP = true; p_2d.needsHPP = true;
 
   results.push(p_2a, p_2b, p_2c, p_2d, p_2e, p_2f, p_2g, p_2h);
 
@@ -1137,7 +1141,7 @@ app.get('/api/cert/run-all', async (_req, res) => {
   const t5  = await run('5 – Register card',  'POST', BASE+'/register',   { merchantTransactionId:ts(), customer:CUST, ...URLS });
   const regId5 = t5.uuid || t5.raw?.registrationId || null;
   const t5a = regId5
-    ? await run('5.a – Deregister',           'POST', BASE+'/deregister',  { merchantTransactionId:ts(), registrationId: regId5 })
+    ? await run('5.a – Deregister',           'POST', BASE+'/deregister',  { merchantTransactionId:ts(), referenceUuid: regId5 })
     : { label:'5.a – Deregister', success:false, uuid:null, redirectUrl:null, raw:{ error:'No registrationId from Test 5' } };
 
   results.push(t5, t5a);
@@ -1224,18 +1228,19 @@ tr:hover td{background:#1a2636}
 <div id="status"></div>
 <div id="table-wrap">
   <p style="font-size:12px;color:#fbbf24;margin-bottom:12px">
-    ⚠️ For Capture / Void / Refund / Reversal / Incremental tests: those need you to <strong>open the HPP link</strong> from the matching debit/preauth row first (enter success card), then click <strong>Re-run dependent tests</strong> below.
+    ⚠️ After Run All: (1) Open &amp; complete HPP for rows <strong>1.a</strong> and <strong>2.a</strong> to unlock RECURRING/CARDONFILE tests; (2) Open &amp; complete HPP for rows <strong>1.e</strong> and <strong>2.e</strong> to unlock Capture/Void/Refund/Reversal/Incremental. Then click <strong>↻ Re-run</strong> below.
   </p>
   <table id="results-table">
     <thead><tr><th>#</th><th>Test</th><th>Status</th><th>UUID / Registration ID</th><th>HPP Link (open &amp; pay)</th><th>Remark (paste into Till form)</th></tr></thead>
     <tbody id="results-body"></tbody>
   </table>
-  <button id="rerun-btn" onclick="rerunDependent()" style="margin-top:16px;padding:10px 24px;background:#7c3aed;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer">↻ Re-run Capture / Void / Refund / Reversal / Incremental</button>
+  <button id="rerun-btn" onclick="rerunDependent()" style="margin-top:16px;padding:10px 24px;background:#7c3aed;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer">↻ Re-run After HPP (RECURRING/CARDONFILE + Capture/Void/Refund/Reversal)</button>
 </div>
 
 <script>
 let lastResults = [];
 let debitUuid = null, preauthUuid = null, regId5 = null;
+let debitInitialUuid = null, preauthInitialUuid = null;
 
 function uid(){ return 'HOC-CERT-'+Date.now()+'-'+Math.floor(Math.random()*9999); }
 async function post(url, body){ const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); return r.json(); }
@@ -1258,7 +1263,7 @@ function renderRow(r, idx){
   const errInfo = r.raw?.errors?.[0]
     ? \`\${r.raw.errors[0].errorCode}: \${r.raw.errors[0].errorMessage||r.raw.errors[0].message||''}\`
     : (r.raw?.errorMessage ? \`\${r.raw.errorCode ? r.raw.errorCode+': ' : ''}\${r.raw.errorMessage}\` : (r.raw?.error || ''));
-  const needsHPP = r.label.includes('needs HPP');
+  const needsHPP = r.label.includes('needs HPP') || r.needsHPP === true;
   
   const rawSummary = JSON.stringify(r.raw || {}).substring(0, 300).replace(/'/g, '&apos;').replace(/"/g, '&quot;');
   let statusBadge;
@@ -1332,15 +1337,17 @@ function renderAll(results){
 async function runAll(){
   const btn = document.getElementById('run-btn');
   btn.disabled=true; btn.textContent='Running…';
-  setStatus('Calling Till API for all 28 tests… ~3 minutes (throttled to avoid rate limit).');
+  setStatus('Calling Till API for all 28 tests… ~4 minutes (throttled to avoid rate limit).');
   try {
     const resp = await fetch('/api/cert/run-all');
     const data = await resp.json();
     lastResults = data.results;
     // Extract key UUIDs for re-run
-    debitUuid   = lastResults.find(r=>r.label.includes('1.e'))?.uuid || null;
-    preauthUuid = lastResults.find(r=>r.label.includes('2.e'))?.uuid || null;
-    regId5      = lastResults.find(r=>r.label.includes('5 –'))?.uuid || null;
+    debitUuid          = lastResults.find(r=>r.label.includes('1.e'))?.uuid || null;
+    preauthUuid        = lastResults.find(r=>r.label.includes('2.e'))?.uuid || null;
+    regId5             = lastResults.find(r=>r.label.includes('5 –'))?.uuid || null;
+    debitInitialUuid   = lastResults.find(r=>r.label.includes('1.a'))?.uuid || null;
+    preauthInitialUuid = lastResults.find(r=>r.label.includes('2.a'))?.uuid || null;
     renderAll(lastResults);
     const ok = lastResults.filter(r=>r.success).length;
     setStatus(\`Done. \${ok}/\${lastResults.length} API calls succeeded. HPP-dependent tests show PENDING — open each link, pay, then click Re-run below.\`);
@@ -1351,25 +1358,48 @@ async function runAll(){
 }
 
 async function rerunDependent(){
-  if(!debitUuid && !preauthUuid){ alert('Run all tests first.'); return; }
-  setStatus('Re-running Capture / Void / Refund / Reversal / Incremental…');
+  if(!debitUuid && !preauthUuid && !debitInitialUuid && !preauthInitialUuid){ alert('Run all tests first.'); return; }
   const t = ()=>'HOC-CERT-'+Date.now()+'-'+Math.floor(Math.random()*9999);
+  const btn = document.getElementById('rerun-btn');
+  btn.disabled = true;
+  setStatus('Re-running RECURRING/CARDONFILE + Capture / Void / Refund / Reversal / Incremental… ~2 minutes.');
 
-  const cap  = debitUuid  ? await post('/api/till/capture/'+preauthUuid,  {amount:'1.00',currency:'AUD',merchantTransactionId:t()}) : {success:false,raw:{error:'No preauth uuid'}};
-  await sleep(6000);
-  const capP = preauthUuid? await post('/api/till/capture/'+preauthUuid,  {amount:'0.50',currency:'AUD',merchantTransactionId:t()}) : {success:false,raw:{error:'No preauth uuid'}};
-  await sleep(6000);
-  const vd   = preauthUuid? await post('/api/till/void/'+preauthUuid,     {}) : {success:false,raw:{error:'No preauth uuid'}};
-  await sleep(6000);
-  const ref  = debitUuid  ? await post('/api/till/refund/'+debitUuid,     {amount:'1.00',currency:'AUD',reason:'Customer refund request'}) : {success:false,raw:{error:'No debit uuid'}};
-  await sleep(6000);
-  const refP = debitUuid  ? await post('/api/till/refund/'+debitUuid,     {amount:'0.50',currency:'AUD',reason:'Partial refund'}) : {success:false,raw:{error:'No debit uuid'}};
-  await sleep(6000);
-  const rev  = debitUuid  ? await post('/api/till/reversal/'+debitUuid,   {}) : {success:false,raw:{error:'No debit uuid'}};
-  await sleep(6000);
-  const inc  = preauthUuid? await post('/api/till/incremental/'+preauthUuid, {amount:'0.25',currency:'AUD'}) : {success:false,raw:{error:'No preauth uuid'}};
+  // ── RECURRING / CARDONFILE (needs 1.a / 2.a HPP completed first)
+  const rec1b = debitInitialUuid   ? await post('/api/till/debit',   {transactionIndicator:'RECURRING',                    referenceUuid:debitInitialUuid,   amount:'1.00',currency:'AUD',merchantTransactionId:t(),descriptor:'HOC Cert 1.b'}) : {success:false,raw:{error:'No initial debit uuid — complete HPP on row 1 (1.a) first'}};
+  await sleep(8000);
+  const cof1c = debitInitialUuid   ? await post('/api/till/debit',   {transactionIndicator:'CARDONFILE',                   referenceUuid:debitInitialUuid,   amount:'1.00',currency:'AUD',merchantTransactionId:t(),descriptor:'HOC Cert 1.c'}) : {success:false,raw:{error:'No initial debit uuid — complete HPP on row 1 (1.a) first'}};
+  await sleep(8000);
+  const cof1d = debitInitialUuid   ? await post('/api/till/debit',   {transactionIndicator:'CARDONFILE-MERCHANT-INITIATED', referenceUuid:debitInitialUuid,   amount:'1.00',currency:'AUD',merchantTransactionId:t(),descriptor:'HOC Cert 1.d'}) : {success:false,raw:{error:'No initial debit uuid — complete HPP on row 1 (1.a) first'}};
+  await sleep(8000);
+  const rec2b = preauthInitialUuid ? await post('/api/till/preauth', {transactionIndicator:'RECURRING',                    referenceUuid:preauthInitialUuid, amount:'1.00',currency:'AUD',merchantTransactionId:t(),descriptor:'HOC Cert 2.b'}) : {success:false,raw:{error:'No initial preauth uuid — complete HPP on row 9 (2.a) first'}};
+  await sleep(8000);
+  const cof2c = preauthInitialUuid ? await post('/api/till/preauth', {transactionIndicator:'CARDONFILE',                   referenceUuid:preauthInitialUuid, amount:'1.00',currency:'AUD',merchantTransactionId:t(),descriptor:'HOC Cert 2.c'}) : {success:false,raw:{error:'No initial preauth uuid — complete HPP on row 9 (2.a) first'}};
+  await sleep(8000);
+  const cof2d = preauthInitialUuid ? await post('/api/till/preauth', {transactionIndicator:'CARDONFILE-MERCHANT-INITIATED', referenceUuid:preauthInitialUuid, amount:'1.00',currency:'AUD',merchantTransactionId:t(),descriptor:'HOC Cert 2.d'}) : {success:false,raw:{error:'No initial preauth uuid — complete HPP on row 9 (2.a) first'}};
+  await sleep(8000);
+
+  // ── Capture / Void / Refund / Reversal / Incremental (needs 1.e / 2.e HPP completed first)
+  const cap  = preauthUuid ? await post('/api/till/capture/'+preauthUuid,  {amount:'1.00',currency:'AUD',merchantTransactionId:t()}) : {success:false,raw:{error:'No preauth uuid'}};
+  await sleep(8000);
+  const capP = preauthUuid ? await post('/api/till/capture/'+preauthUuid,  {amount:'0.50',currency:'AUD',merchantTransactionId:t()}) : {success:false,raw:{error:'No preauth uuid'}};
+  await sleep(8000);
+  const vd   = preauthUuid ? await post('/api/till/void/'+preauthUuid,     {}) : {success:false,raw:{error:'No preauth uuid'}};
+  await sleep(8000);
+  const ref  = debitUuid   ? await post('/api/till/refund/'+debitUuid,     {amount:'1.00',currency:'AUD',reason:'Customer refund request'}) : {success:false,raw:{error:'No debit uuid'}};
+  await sleep(8000);
+  const refP = debitUuid   ? await post('/api/till/refund/'+debitUuid,     {amount:'0.50',currency:'AUD',reason:'Partial refund'}) : {success:false,raw:{error:'No debit uuid'}};
+  await sleep(8000);
+  const rev  = debitUuid   ? await post('/api/till/reversal/'+debitUuid,   {}) : {success:false,raw:{error:'No debit uuid'}};
+  await sleep(8000);
+  const inc  = preauthUuid ? await post('/api/till/incremental/'+preauthUuid, {amount:'0.25',currency:'AUD'}) : {success:false,raw:{error:'No preauth uuid'}};
 
   const depResults = [
+    {label:'1.b – Debit RECURRING',                  ...rec1b, uuid:rec1b.uuid||null},
+    {label:'1.c – Debit CARDONFILE',                 ...cof1c, uuid:cof1c.uuid||null},
+    {label:'1.d – Debit CARDONFILE-MERCHANT-INIT',   ...cof1d, uuid:cof1d.uuid||null},
+    {label:'2.b – Preauth RECURRING',                ...rec2b, uuid:rec2b.uuid||null},
+    {label:'2.c – Preauth CARDONFILE',               ...cof2c, uuid:cof2c.uuid||null},
+    {label:'2.d – Preauth CARDONFILE-MERCHANT-INIT', ...cof2d, uuid:cof2d.uuid||null},
     {label:'3 – Capture full',     ...cap,  uuid:cap.uuid||null},
     {label:'3.a – Capture partial',...capP, uuid:capP.uuid||null},
     {label:'4 – Void preauth',     ...vd,   uuid:vd.uuid||null},
@@ -1381,6 +1411,8 @@ async function rerunDependent(){
 
   // Patch lastResults at their positions and re-render
   const positions = {
+    '1.b – Debit RECURRING': 1, '1.c – Debit CARDONFILE': 2, '1.d – Debit CARDONFILE-MERCHANT-INIT': 3,
+    '2.b – Preauth RECURRING': 9, '2.c – Preauth CARDONFILE': 10, '2.d – Preauth CARDONFILE-MERCHANT-INIT': 11,
     '3 – Capture full': 16, '3.a – Capture partial': 17, '4 – Void preauth': 18,
     '6 – Full refund': 21, '7 – Partial refund': 22, '8 – Reversal': 23, '9 – Incremental auth': 24
   };
@@ -1390,6 +1422,7 @@ async function rerunDependent(){
     }
   }
   renderAll(lastResults);
+  btn.disabled = false;
   setStatus('Re-run complete. Check updated rows above.');
 }
 </script>
@@ -1431,15 +1464,17 @@ function build3DSBlock(mode) {
 function buildPayload(body, extra = {}) {
   const { pan, expiryMonth, expiryYear, cvv, amount, currency,
           transactionIndicator = 'SINGLE', merchantTransactionId,
-          descriptor, registrationId, email, threeDSMode } = body;
+          descriptor, registrationId, referenceUuid, email, threeDSMode } = body;
+
+  // Server-to-server calls (RECURRING/CARDONFILE with referenceUuid) must NOT include
+  // HPP redirect URLs — Till rejects them with error 1002 (invalid properties).
+  const isServerToServer = !!referenceUuid;
 
   const payload = {
     merchantTransactionId: merchantTransactionId || `HOC-TEST-${Date.now()}`,
     amount,
     currency: currency || 'AUD',
-    successUrl: SUCCESS_URL,
-    cancelUrl:  CANCEL_URL,
-    errorUrl:   ERROR_URL,
+    ...(isServerToServer ? {} : { successUrl: SUCCESS_URL, cancelUrl: CANCEL_URL, errorUrl: ERROR_URL }),
     callbackUrl: CALLBACK_URL,
     description: descriptor || 'High on Chapel Certification Test',
     customer: {
@@ -1461,6 +1496,11 @@ function buildPayload(body, extra = {}) {
   // Include registrationId for recurring / card-on-file tests
   if (registrationId) {
     payload.registrationId = registrationId;
+  }
+
+  // Include referenceUuid for RECURRING / CARDONFILE server-to-server calls
+  if (referenceUuid) {
+    payload.referenceUuid = referenceUuid;
   }
 
   // descriptor is already mapped to payload.description above — do not also send as 'descriptor'
@@ -1571,14 +1611,14 @@ app.post('/api/till/register', paymentLimiter, async (req, res) => {
 
 app.post('/api/till/deregister', async (req, res) => {
   try {
-    const { registrationId } = req.body;
-    if (!registrationId) return res.status(400).json({ error: 'registrationId required' });
+    const { referenceUuid } = req.body;
+    if (!referenceUuid) return res.status(400).json({ error: 'referenceUuid required' });
     const payload = {
       merchantTransactionId: `HOC-DEREG-${Date.now()}`,
-      registrationId
+      referenceUuid
     };
     const result = await callTillAPI('POST', `/api/v3/transaction/${TILL_API_KEY}/deregister`, payload);
-    logger.info('[CERT] Deregister', { registrationId, status: result.status });
+    logger.info('[CERT] Deregister', { referenceUuid, status: result.status });
     res.json({ success: result.body?.success ?? false, ...result.body, _httpStatus: result.status });
   } catch (err) {
     logger.error('[CERT] Deregister error', { error: err.message });
