@@ -88,6 +88,13 @@ for (const key of REQUIRED_ENV) {
   }
 }
 
+// Cert-test redirect URLs — hosted on this middleware server so they always work
+// regardless of whether the Shopify storefront pages are configured correctly.
+const CERT_ORIGIN      = new URL(CALLBACK_URL).origin;
+const CERT_SUCCESS_URL = `${CERT_ORIGIN}/cert-paid`;
+const CERT_CANCEL_URL  = `${CERT_ORIGIN}/cert-cancelled`;
+const CERT_ERROR_URL   = `${CERT_ORIGIN}/cert-error`;
+
 // ─── Diagnostic: log env var presence at startup (not values) ───────────────
 console.log('[BOOT] Webhook secret configured:', {
   SHOPIFY_WEBHOOK_SECRET: SHOPIFY_WEBHOOK_SECRET ? `${SHOPIFY_WEBHOOK_SECRET.substring(0, 6)}...(${SHOPIFY_WEBHOOK_SECRET.length} chars)` : 'UNSET',
@@ -1064,6 +1071,79 @@ app.post('/api/till-callback', async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
+// CERT-TEST REDIRECT PAGES
+// ═════════════════════════════════════════════════════════════════════════════
+// Till redirects the browser here after the customer completes (or cancels/
+// errors on) the Hosted Payment Page.  These pages are self-contained so they
+// work regardless of the Shopify storefront theme configuration.
+
+function certRedirectPage({ icon, colour, title, message, extra = '' }) {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>${title} – High on Chapel</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{background:#0a1628;min-height:100vh;display:flex;align-items:center;justify-content:center;
+         font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;padding:20px}
+    .card{background:#0f1b2d;border:1px solid rgba(255,255,255,.12);border-radius:16px;
+          padding:48px 32px;max-width:460px;width:100%;text-align:center;color:#e8edf3;
+          box-shadow:0 8px 32px rgba(0,0,0,.3)}
+    svg{margin-bottom:20px}
+    h1{font-size:1.4rem;font-weight:700;color:#fff;margin-bottom:12px}
+    p{font-size:.95rem;color:#8899aa;line-height:1.6;margin-bottom:28px}
+    a.btn{display:inline-block;padding:14px 32px;border-radius:8px;font-size:.9rem;font-weight:700;
+          text-decoration:none;text-transform:uppercase;letter-spacing:.04em;
+          background:linear-gradient(135deg,${colour} 0%,${colour}cc 100%);
+          color:#fff;box-shadow:0 2px 8px ${colour}55}
+    .note{font-size:.7rem;color:#556677;margin-top:24px}
+  </style>
+</head>
+<body>
+  <div class="card">
+    ${icon}
+    <h1>${title}</h1>
+    <p>${message}</p>
+    <a class="btn" href="/">← Back to Certification Dashboard</a>
+    ${extra}
+    <p class="note">Secured by Till Payments · 256-bit SSL Encrypted</p>
+  </div>
+</body>
+</html>`;
+}
+
+app.get('/cert-paid', (_req, res) => {
+  res.send(certRedirectPage({
+    icon: `<svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="#4ade80" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>`,
+    colour: '#16a34a',
+    title:  'Payment Successful',
+    message:'Your payment was processed successfully. Return to the certification dashboard to continue.'
+  }));
+});
+
+app.get('/cert-cancelled', (_req, res) => {
+  res.send(certRedirectPage({
+    icon: `<svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>`,
+    colour: '#d97706',
+    title:  'Payment Cancelled',
+    message:'The payment was cancelled. Return to the certification dashboard and try again.'
+  }));
+});
+
+app.get('/cert-error', (_req, res) => {
+  const qs = Object.entries(_req.query).map(([k,v])=>`${k}=${v}`).join(' · ') || '';
+  res.send(certRedirectPage({
+    icon: `<svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>`,
+    colour: '#dc2626',
+    title:  'Payment Error',
+    message:'Something went wrong during payment processing. Return to the certification dashboard and try again.',
+    extra: qs ? `<p class="note" style="margin-top:8px">${qs}</p>` : ''
+  }));
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
 // ENDPOINT: GET /api/cert/run-all
 // ═════════════════════════════════════════════════════════════════════════════
 // Runs ALL certification API calls automatically and returns results as JSON.
@@ -1088,7 +1168,7 @@ app.get('/api/cert/run-all', async (_req, res) => {
 
   const BASE  = `/api/v3/transaction/${TILL_API_KEY}`;
   const CUST  = { firstName:'Test', lastName:'Customer', email:'cert@highonchapel.com', ipAddress:'127.0.0.1', billingCountry:'AU' };
-  const URLS  = { successUrl: SUCCESS_URL, cancelUrl: CANCEL_URL, errorUrl: ERROR_URL, callbackUrl: CALLBACK_URL };
+  const URLS  = { successUrl: CERT_SUCCESS_URL, cancelUrl: CERT_CANCEL_URL, errorUrl: CERT_ERROR_URL, callbackUrl: CALLBACK_URL };
 
   // ── Tests 1.e/1.g/1.h — plain debit (SINGLE, no 3DS / mandatory / optional)
   const d_1e = await run('1.e – Debit SINGLE no 3DS',       'POST', BASE+'/debit',       { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'HOC Cert 1.e', customer:CUST, ...URLS });
@@ -1474,7 +1554,7 @@ function buildPayload(body, extra = {}) {
     merchantTransactionId: merchantTransactionId || `HOC-TEST-${Date.now()}`,
     amount,
     currency: currency || 'AUD',
-    ...(isServerToServer ? {} : { successUrl: SUCCESS_URL, cancelUrl: CANCEL_URL, errorUrl: ERROR_URL }),
+    ...(isServerToServer ? {} : { successUrl: CERT_SUCCESS_URL, cancelUrl: CERT_CANCEL_URL, errorUrl: CERT_ERROR_URL }),
     callbackUrl: CALLBACK_URL,
     description: descriptor || 'High on Chapel Certification Test',
     customer: {
