@@ -1073,8 +1073,10 @@ app.post('/api/till-callback', async (req, res) => {
 app.get('/api/cert/run-all', async (_req, res) => {
   const ts = () => `HOC-CERT-${Date.now()}-${Math.floor(Math.random()*9999)}`;
   const results = [];
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
 
   async function run(label, method, path, body = {}) {
+    await sleep(400); // throttle: Till sandbox rate limit (1009)
     try {
       const r = await callTillAPI(method, path, body);
       const d = r.body || {};
@@ -1327,7 +1329,7 @@ function renderAll(results){
 async function runAll(){
   const btn = document.getElementById('run-btn');
   btn.disabled=true; btn.textContent='Running…';
-  setStatus('Calling Till API for all 28 tests… this takes ~10 seconds.');
+  setStatus('Calling Till API for all 28 tests… ~20 seconds (throttled to avoid rate limit).');
   try {
     const resp = await fetch('/api/cert/run-all');
     const data = await resp.json();
