@@ -1204,16 +1204,15 @@ app.get('/api/cert/run-all', async (_req, res) => {
 
   results.push(p_2a, p_2b, p_2c, p_2d, p_2e, p_2f, p_2g, p_2h);
 
-  // Save a single preauth UUID for capture / void / incremental tests
-  const preauthUuid = p_2e.uuid || p_2a.uuid || null;
-  const preauthUuid2 = p_2g.uuid || null; // separate one for Test 4 void (don't capture this one)
+  // Each downstream test uses a DIFFERENT preauth UUID so they don't conflict
+  const preauthUuid  = p_2e.uuid || p_2a.uuid || null; // Capture full (3)
+  const preauthUuid2 = p_2f.uuid || null;              // Capture partial (3.a)
+  const preauthUuid3 = p_2g.uuid || null;              // Void (4)
+  const preauthUuid4 = p_2h.uuid || null;              // Incremental auth (9)
 
-  // ── Test 3 (full capture) — needs the preauth to first be PAID via HPP
-  //    We fire it here but it will return error 1006 until HPP is completed.
-  //    UUID is captured in the result so the user can re-run manually later.
   const t3  = await run('3 – Capture full (needs HPP done first)',   'POST', BASE+'/capture',                 { merchantTransactionId:ts(), referenceUuid: preauthUuid || 'PENDING', amount:'1.00', currency:'AUD' });
-  const t3a = await run('3.a – Capture partial (needs HPP done)',    'POST', BASE+'/capture',                 { merchantTransactionId:ts(), referenceUuid: preauthUuid || 'PENDING', amount:'0.50', currency:'AUD' });
-  const t4  = await run('4 – Void preauth (needs HPP done)',         'POST', BASE+'/void',                   { merchantTransactionId:ts(), referenceUuid: preauthUuid2 || preauthUuid || 'PENDING' });
+  const t3a = await run('3.a – Capture partial (needs HPP done)',    'POST', BASE+'/capture',                 { merchantTransactionId:ts(), referenceUuid: preauthUuid2 || preauthUuid || 'PENDING', amount:'0.50', currency:'AUD' });
+  const t4  = await run('4 – Void preauth (needs HPP done)',         'POST', BASE+'/void',                   { merchantTransactionId:ts(), referenceUuid: preauthUuid3 || preauthUuid || 'PENDING' });
 
   results.push(t3, t3a, t4);
 
@@ -1227,19 +1226,21 @@ app.get('/api/cert/run-all', async (_req, res) => {
 
   results.push(t5, t5a);
 
-  // ── Tests 6+7 — refund (need debit UUID that completed HPP — use 1.e uuid)
-  const debitUuid = d_1e.uuid || null;
+  // Each downstream test uses a DIFFERENT debit UUID so they don't conflict
+  const debitUuid  = d_1e.uuid || null;               // Full refund (6)
+  const debitUuid2 = d_1f.uuid || null;               // Partial refund (7)
+  const debitUuid3 = d_1g.uuid || null;               // Reversal (8)
   const t6  = await run('6 – Full refund (needs HPP done)',    'POST', BASE+'/refund',   { merchantTransactionId:ts(), referenceUuid: debitUuid || 'PENDING', amount:'1.00', currency:'AUD', description:'Customer refund request' });
-  const t7  = await run('7 – Partial refund (needs HPP done)', 'POST', BASE+'/refund',   { merchantTransactionId:ts(), referenceUuid: debitUuid || 'PENDING', amount:'0.50', currency:'AUD', description:'Partial customer refund' });
+  const t7  = await run('7 – Partial refund (needs HPP done)', 'POST', BASE+'/refund',   { merchantTransactionId:ts(), referenceUuid: debitUuid2 || debitUuid || 'PENDING', amount:'0.50', currency:'AUD', description:'Partial customer refund' });
 
   results.push(t6, t7);
 
   // ── Test 8 — reversal
-  const t8  = await run('8 – Reversal (needs HPP done)',       'POST', BASE+'/reversal', { merchantTransactionId:ts(), referenceUuid: debitUuid || 'PENDING' });
+  const t8  = await run('8 – Reversal (needs HPP done)',       'POST', BASE+'/reversal', { merchantTransactionId:ts(), referenceUuid: debitUuid3 || debitUuid || 'PENDING' });
   results.push(t8);
 
   // ── Test 9 — incremental auth
-  const t9  = await run('9 – Incremental auth (needs HPP done)', 'POST', BASE+'/incrementalAuthorization', { merchantTransactionId:ts(), referenceUuid: preauthUuid || 'PENDING', amount:'0.25', currency:'AUD' });
+  const t9  = await run('9 – Incremental auth (needs HPP done)', 'POST', BASE+'/incrementalAuthorization', { merchantTransactionId:ts(), referenceUuid: preauthUuid4 || preauthUuid || 'PENDING', amount:'0.25', currency:'AUD' });
   results.push(t9);
 
   // ── Test 10 — negative tests (use SINGLE/no 3DS — user enters decline card on HPP)
@@ -1321,7 +1322,7 @@ tr:hover td{background:#1a2636}
 <div id="status"></div>
 <div id="table-wrap">
   <p style="font-size:12px;color:#fbbf24;margin-bottom:12px">
-    ⚠️ After Run All: (1) Open &amp; complete HPP for rows <strong>1.a</strong> and <strong>2.a</strong> to unlock RECURRING/CARDONFILE tests; (2) Open &amp; complete HPP for rows <strong>1.e</strong> and <strong>2.e</strong> to unlock Capture/Void/Refund/Reversal/Incremental. Then click <strong>↻ Re-run</strong> below.
+    ⚠️ After Run All: Open &amp; complete <strong>ALL</strong> "Open Payment Page" links (success card for tests 1–9, decline card for 10.a–10.c). Each Capture/Void/Refund/Reversal/Incremental uses a different source transaction. Then click <strong>↻ Re-run</strong> below.
   </p>
   <table id="results-table">
     <thead><tr><th>#</th><th>Test</th><th>Status</th><th>UUID / Registration ID</th><th>HPP Link (open &amp; pay)</th><th>Remark (paste into Till form)</th></tr></thead>
@@ -1332,7 +1333,9 @@ tr:hover td{background:#1a2636}
 
 <script>
 let lastResults = [];
-let debitUuid = null, preauthUuid = null, regId5 = null;
+let debitUuid = null, debitUuid2 = null, debitUuid3 = null;
+let preauthUuid = null, preauthUuid2 = null, preauthUuid3 = null, preauthUuid4 = null;
+let regId5 = null;
 let debitInitialUuid = null, preauthInitialUuid = null;
 
 function uid(){ return 'HOC-CERT-'+Date.now()+'-'+Math.floor(Math.random()*9999); }
@@ -1463,7 +1466,12 @@ async function runAll(){
     lastResults = data.results;
     // Extract key UUIDs for re-run
     debitUuid          = lastResults.find(r=>r.label.includes('1.e'))?.uuid || null;
+    debitUuid2         = lastResults.find(r=>r.label.includes('1.f'))?.uuid || null;
+    debitUuid3         = lastResults.find(r=>r.label.includes('1.g'))?.uuid || null;
     preauthUuid        = lastResults.find(r=>r.label.includes('2.e'))?.uuid || null;
+    preauthUuid2       = lastResults.find(r=>r.label.includes('2.f'))?.uuid || null;
+    preauthUuid3       = lastResults.find(r=>r.label.includes('2.g'))?.uuid || null;
+    preauthUuid4       = lastResults.find(r=>r.label.includes('2.h'))?.uuid || null;
     regId5             = lastResults.find(r=>r.label.includes('5 –'))?.uuid || null;
     debitInitialUuid   = lastResults.find(r=>r.label.includes('1.a'))?.uuid || null;
     preauthInitialUuid = lastResults.find(r=>r.label.includes('2.a'))?.uuid || null;
@@ -1512,10 +1520,10 @@ async function rerunDependent(){
   const cap  = preauthUuid ? await post('/api/till/capture/'+preauthUuid,  {amount:'1.00',currency:'AUD',merchantTransactionId:t()}) : {success:false,raw:{error:'No preauth uuid'}};
   await sleep(10000);
   stepProgress('Capture partial (3a)');
-  const capP = preauthUuid ? await post('/api/till/capture/'+preauthUuid,  {amount:'0.50',currency:'AUD',merchantTransactionId:t()}) : {success:false,raw:{error:'No preauth uuid'}};
+  const capP = (preauthUuid2||preauthUuid) ? await post('/api/till/capture/'+(preauthUuid2||preauthUuid),  {amount:'0.50',currency:'AUD',merchantTransactionId:t()}) : {success:false,raw:{error:'No preauth uuid (complete HPP on 2.f)'}};
   await sleep(10000);
   stepProgress('Void preauth (4)');
-  const vd   = preauthUuid ? await post('/api/till/void/'+preauthUuid,     {}) : {success:false,raw:{error:'No preauth uuid'}};
+  const vd   = (preauthUuid3||preauthUuid) ? await post('/api/till/void/'+(preauthUuid3||preauthUuid),     {}) : {success:false,raw:{error:'No preauth uuid (complete HPP on 2.g)'}};
   await sleep(10000);
   stepProgress('Deregister (5.a)');
   const dereg = regId5 ? await post('/api/till/deregister', {referenceUuid:regId5, merchantTransactionId:t()}) : {success:false,raw:{error:'No register uuid — complete HPP on Register (5) first'}};
@@ -1524,13 +1532,13 @@ async function rerunDependent(){
   const ref  = debitUuid   ? await post('/api/till/refund/'+debitUuid,     {amount:'1.00',currency:'AUD',reason:'Customer refund request'}) : {success:false,raw:{error:'No debit uuid'}};
   await sleep(10000);
   stepProgress('Partial refund (7)');
-  const refP = debitUuid   ? await post('/api/till/refund/'+debitUuid,     {amount:'0.50',currency:'AUD',reason:'Partial refund'}) : {success:false,raw:{error:'No debit uuid'}};
+  const refP = (debitUuid2||debitUuid)   ? await post('/api/till/refund/'+(debitUuid2||debitUuid),     {amount:'0.50',currency:'AUD',reason:'Partial refund'}) : {success:false,raw:{error:'No debit uuid (complete HPP on 1.f)'}};
   await sleep(10000);
   stepProgress('Reversal (8)');
-  const rev  = debitUuid   ? await post('/api/till/reversal/'+debitUuid,   {}) : {success:false,raw:{error:'No debit uuid'}};
+  const rev  = (debitUuid3||debitUuid)   ? await post('/api/till/reversal/'+(debitUuid3||debitUuid),   {}) : {success:false,raw:{error:'No debit uuid (complete HPP on 1.g)'}};
   await sleep(10000);
   stepProgress('Incremental auth (9)');
-  const inc  = preauthUuid ? await post('/api/till/incremental/'+preauthUuid, {amount:'0.25',currency:'AUD'}) : {success:false,raw:{error:'No preauth uuid'}};
+  const inc  = (preauthUuid4||preauthUuid) ? await post('/api/till/incremental/'+(preauthUuid4||preauthUuid), {amount:'0.25',currency:'AUD'}) : {success:false,raw:{error:'No preauth uuid (complete HPP on 2.h)'}};  
 
   const depResults = [
     {label:'1.b – Debit RECURRING',                  ...rec1b, uuid:rec1b.uuid||null},
