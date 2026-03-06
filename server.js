@@ -1239,6 +1239,7 @@ let debitUuid = null, preauthUuid = null, regId5 = null;
 
 function uid(){ return 'HOC-CERT-'+Date.now()+'-'+Math.floor(Math.random()*9999); }
 async function post(url, body){ const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); return r.json(); }
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function copyText(txt){
   navigator.clipboard.writeText(txt).catch(()=>{
@@ -1353,11 +1354,17 @@ async function rerunDependent(){
   const t = ()=>'HOC-CERT-'+Date.now()+'-'+Math.floor(Math.random()*9999);
 
   const cap  = debitUuid  ? await post('/api/till/capture/'+preauthUuid,  {amount:'1.00',currency:'AUD',merchantTransactionId:t()}) : {success:false,raw:{error:'No preauth uuid'}};
+  await sleep(4000);
   const capP = preauthUuid? await post('/api/till/capture/'+preauthUuid,  {amount:'0.50',currency:'AUD',merchantTransactionId:t()}) : {success:false,raw:{error:'No preauth uuid'}};
+  await sleep(4000);
   const vd   = preauthUuid? await post('/api/till/void/'+preauthUuid,     {}) : {success:false,raw:{error:'No preauth uuid'}};
+  await sleep(4000);
   const ref  = debitUuid  ? await post('/api/till/refund/'+debitUuid,     {amount:'1.00',currency:'AUD',reason:'Customer refund request'}) : {success:false,raw:{error:'No debit uuid'}};
+  await sleep(4000);
   const refP = debitUuid  ? await post('/api/till/refund/'+debitUuid,     {amount:'0.50',currency:'AUD',reason:'Partial refund'}) : {success:false,raw:{error:'No debit uuid'}};
+  await sleep(4000);
   const rev  = debitUuid  ? await post('/api/till/reversal/'+debitUuid,   {}) : {success:false,raw:{error:'No debit uuid'}};
+  await sleep(4000);
   const inc  = preauthUuid? await post('/api/till/incremental/'+preauthUuid, {amount:'0.25',currency:'AUD'}) : {success:false,raw:{error:'No preauth uuid'}};
 
   const depResults = [
