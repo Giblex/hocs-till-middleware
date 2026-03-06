@@ -1156,7 +1156,7 @@ app.get('/api/cert/run-all', async (_req, res) => {
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
   async function run(label, method, path, body = {}) {
-    await sleep(10000); // throttle: Till sandbox rate limit (~5 req/30s)
+    await sleep(12000); // throttle: Till sandbox rate limit
     try {
       const r = await callTillAPI(method, path, body);
       const d = r.body || {};
@@ -1450,11 +1450,11 @@ function renderAll(results){
 async function runAll(){
   const btn = document.getElementById('run-btn');
   btn.disabled=true; btn.textContent='Running…';
-  setStatus('Calling Till API for all 28 tests… ~5 minutes (throttled to avoid rate limit).');
+  setStatus('Calling Till API for all 28 tests… ~6 minutes (throttled to avoid rate limit).');
   startTimer();
   showProgress('Running 28 tests on Till sandbox…', 0);
   // Animate a time-based estimate bar (~220s expected)
-  const estMs = 300000; const t0 = Date.now();
+  const estMs = 360000; const t0 = Date.now();
   const pInt = setInterval(()=>{ const pct=Math.min(((Date.now()-t0)/estMs)*95,95); showProgress('Running 28 tests on Till sandbox…',pct); },400);
   try {
     const resp = await fetch('/api/cert/run-all');
