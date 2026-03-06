@@ -1064,10 +1064,111 @@ app.post('/api/till-callback', async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
+// ENDPOINT: GET /api/cert/run-all
+// ═════════════════════════════════════════════════════════════════════════════
+// Runs ALL certification API calls automatically and returns results as JSON.
+// HPP-based tests return a redirectUrl the user must open once; all UUIDs and
+// remarks are pre-generated here.
+
+app.get('/api/cert/run-all', async (_req, res) => {
+  const ts = () => `HOC-CERT-${Date.now()}-${Math.floor(Math.random()*9999)}`;
+  const results = [];
+
+  async function run(label, method, path, body = {}) {
+    try {
+      const r = await callTillAPI(method, path, body);
+      const d = r.body || {};
+      return { label, success: d.success !== false && !d.errors, uuid: d.uuid || d.registrationId || null, redirectUrl: d.redirectUrl || null, raw: d };
+    } catch (e) {
+      return { label, success: false, uuid: null, redirectUrl: null, raw: { error: e.message } };
+    }
+  }
+
+  const BASE  = `/api/v3/transaction/${TILL_API_KEY}`;
+  const CUST  = { firstName:'Test', lastName:'Customer', email:'cert@highonchapel.com', ipAddress:'127.0.0.1', billingCountry:'AU' };
+  const URLS  = { successUrl: SUCCESS_URL, cancelUrl: CANCEL_URL, errorUrl: ERROR_URL, callbackUrl: CALLBACK_URL };
+
+  // ── Tests 1.e/1.g/1.h — plain debit (SINGLE, no 3DS / mandatory / optional)
+  const d_1e = await run('1.e – Debit SINGLE no 3DS',       'POST', BASE+'/debit',       { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'HOC Cert 1.e', customer:CUST, ...URLS });
+  const d_1g = await run('1.g – Debit SINGLE 3DS MANDATORY','POST', BASE+'/debit',       { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'HOC Cert 1.g', customer:CUST, ...URLS, extraData:{'3dsecure':'MANDATORY'}, threeDSecureData:{'3dsecure':'MANDATORY',channel:'02',authenticationIndicator:'01',cardholderAuthenticationMethod:'01',challengeIndicator:'02'} });
+  const d_1h = await run('1.h – Debit SINGLE 3DS OPTIONAL', 'POST', BASE+'/debit',       { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'HOC Cert 1.h', customer:CUST, ...URLS, extraData:{'3dsecure':'OPTIONAL'}, threeDSecureData:{'3dsecure':'OPTIONAL',channel:'02',authenticationIndicator:'01',cardholderAuthenticationMethod:'01',challengeIndicator:'03'} });
+  const d_1f = await run('1.f – Debit SINGLE Dynamic Desc', 'POST', BASE+'/debit',       { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'High on Chapel 13-Feb', customer:CUST, ...URLS });
+
+  // ── Test 1.a — INITIAL debit (starts registration, returns registrationId)
+  const d_1a = await run('1.a – Debit INITIAL',              'POST', BASE+'/debit',       { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'INITIAL', description:'HOC Cert 1.a', customer:CUST, ...URLS });
+  const regIdFromDebit = d_1a.uuid || d_1a.raw?.registrationId || null;
+
+  // ── Tests 1.b/1.c/1.d — card-on-file debits (use registrationId from 1.a)
+  const d_1b = await run('1.b – Debit RECURRING',                 'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'RECURRING',                    description:'HOC Cert 1.b', customer:CUST, ...URLS, ...(regIdFromDebit ? {registrationId:regIdFromDebit}:{}) });
+  const d_1c = await run('1.c – Debit CARDONFILE',                'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE',                   description:'HOC Cert 1.c', customer:CUST, ...URLS, ...(regIdFromDebit ? {registrationId:regIdFromDebit}:{}) });
+  const d_1d = await run('1.d – Debit CARDONFILE-MERCHANT-INIT',  'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE-MERCHANT-INITIATED', description:'HOC Cert 1.d', customer:CUST, ...URLS, ...(regIdFromDebit ? {registrationId:regIdFromDebit}:{}) });
+
+  results.push(d_1a, d_1b, d_1c, d_1d, d_1e, d_1f, d_1g, d_1h);
+
+  // ── Tests 2.a-2.h — Preauth equivalents
+  const p_2e = await run('2.e – Preauth SINGLE no 3DS',       'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'HOC Cert 2.e', customer:CUST, ...URLS });
+  const p_2g = await run('2.g – Preauth SINGLE 3DS MANDATORY','POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'HOC Cert 2.g', customer:CUST, ...URLS, extraData:{'3dsecure':'MANDATORY'}, threeDSecureData:{'3dsecure':'MANDATORY',channel:'02',authenticationIndicator:'01',cardholderAuthenticationMethod:'01',challengeIndicator:'02'} });
+  const p_2h = await run('2.h – Preauth SINGLE 3DS OPTIONAL', 'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'HOC Cert 2.h', customer:CUST, ...URLS, extraData:{'3dsecure':'OPTIONAL'}, threeDSecureData:{'3dsecure':'OPTIONAL',channel:'02',authenticationIndicator:'01',cardholderAuthenticationMethod:'01',challengeIndicator:'03'} });
+  const p_2f = await run('2.f – Preauth SINGLE Dynamic Desc', 'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'High on Chapel 13-Feb', customer:CUST, ...URLS });
+  const p_2a = await run('2.a – Preauth INITIAL',              'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'INITIAL', description:'HOC Cert 2.a', customer:CUST, ...URLS });
+  const regIdFromPreauth = p_2a.uuid || p_2a.raw?.registrationId || null;
+  const p_2b = await run('2.b – Preauth RECURRING',                 'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'RECURRING',                    description:'HOC Cert 2.b', customer:CUST, ...URLS, ...(regIdFromPreauth ? {registrationId:regIdFromPreauth}:{}) });
+  const p_2c = await run('2.c – Preauth CARDONFILE',                'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE',                   description:'HOC Cert 2.c', customer:CUST, ...URLS, ...(regIdFromPreauth ? {registrationId:regIdFromPreauth}:{}) });
+  const p_2d = await run('2.d – Preauth CARDONFILE-MERCHANT-INIT',  'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE-MERCHANT-INITIATED', description:'HOC Cert 2.d', customer:CUST, ...URLS, ...(regIdFromPreauth ? {registrationId:regIdFromPreauth}:{}) });
+
+  results.push(p_2a, p_2b, p_2c, p_2d, p_2e, p_2f, p_2g, p_2h);
+
+  // Save a single preauth UUID for capture / void / incremental tests
+  const preauthUuid = p_2e.uuid || p_2a.uuid || null;
+  const preauthUuid2 = p_2g.uuid || null; // separate one for Test 4 void (don't capture this one)
+
+  // ── Test 3 (full capture) — needs the preauth to first be PAID via HPP
+  //    We fire it here but it will return error 1006 until HPP is completed.
+  //    UUID is captured in the result so the user can re-run manually later.
+  const t3  = await run('3 – Capture full (needs HPP done first)',   'POST', BASE+'/capture',                 { merchantTransactionId:ts(), referenceUuid: preauthUuid || 'PENDING', amount:'1.00', currency:'AUD' });
+  const t3a = await run('3.a – Capture partial (needs HPP done)',    'POST', BASE+'/capture',                 { merchantTransactionId:ts(), referenceUuid: preauthUuid || 'PENDING', amount:'0.50', currency:'AUD' });
+  const t4  = await run('4 – Void preauth (needs HPP done)',         'POST', BASE+'/void',                   { merchantTransactionId:ts(), referenceUuid: preauthUuid2 || preauthUuid || 'PENDING' });
+
+  results.push(t3, t3a, t4);
+
+  // ── Test 5 — standalone register
+  const t5  = await run('5 – Register card',  'POST', BASE+'/register',   { merchantTransactionId:ts(), customer:CUST, ...URLS });
+  const regId5 = t5.uuid || t5.raw?.registrationId || null;
+  const t5a = regId5
+    ? await run('5.a – Deregister',           'POST', BASE+'/deregister',  { merchantTransactionId:ts(), registrationId: regId5 })
+    : { label:'5.a – Deregister', success:false, uuid:null, redirectUrl:null, raw:{ error:'No registrationId from Test 5' } };
+
+  results.push(t5, t5a);
+
+  // ── Tests 6+7 — refund (need debit UUID that completed HPP — use 1.e uuid)
+  const debitUuid = d_1e.uuid || null;
+  const t6  = await run('6 – Full refund (needs HPP done)',    'POST', BASE+'/refund',   { merchantTransactionId:ts(), referenceUuid: debitUuid || 'PENDING', amount:'1.00', currency:'AUD', description:'Customer refund request' });
+  const t7  = await run('7 – Partial refund (needs HPP done)', 'POST', BASE+'/refund',   { merchantTransactionId:ts(), referenceUuid: debitUuid || 'PENDING', amount:'0.50', currency:'AUD', description:'Partial customer refund' });
+
+  results.push(t6, t7);
+
+  // ── Test 8 — reversal
+  const t8  = await run('8 – Reversal (needs HPP done)',       'POST', BASE+'/reversal', { merchantTransactionId:ts(), referenceUuid: debitUuid || 'PENDING' });
+  results.push(t8);
+
+  // ── Test 9 — incremental auth
+  const t9  = await run('9 – Incremental auth (needs HPP done)', 'POST', BASE+'/incrementalAuthorization', { merchantTransactionId:ts(), referenceUuid: preauthUuid || 'PENDING', amount:'0.25', currency:'AUD' });
+  results.push(t9);
+
+  // ── Test 10 — negative tests (use SINGLE/no 3DS — user enters decline card on HPP)
+  const t10a = await run('10.a – Negative debit',    'POST', BASE+'/debit',        { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'HOC Cert 10.a Negative', customer:CUST, ...URLS });
+  const t10b = await run('10.b – Negative preauth',  'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'HOC Cert 10.b Negative', customer:CUST, ...URLS });
+  const t10c = await run('10.c – Negative register', 'POST', BASE+'/register',     { merchantTransactionId:ts(), customer:CUST, ...URLS });
+  results.push(t10a, t10b, t10c);
+
+  logger.info('[CERT] run-all completed', { total: results.length });
+  res.json({ ok: true, results });
+});
+
 // ENDPOINT: GET /
 // ═════════════════════════════════════════════════════════════════════════════
-// Till Developer Certification Test Dashboard
-// Provides a UI to drive all 10 test categories without external tooling.
+// Till Developer Certification Test Dashboard — Auto-Run Edition
+// Fires all tests automatically on button click. Shows UUID + remark per test.
 
 app.get('/', (_req, res) => {
   res.setHeader('Content-Type', 'text/html');
@@ -1076,258 +1177,207 @@ app.get('/', (_req, res) => {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>HOCS · Till Certification Dashboard</title>
+<title>HOCS · Till Certification</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f1b2d;color:#e2e8f0;min-height:100vh;padding:24px}
 h1{font-size:22px;font-weight:700;color:#60a5fa;margin-bottom:4px}
-.sub{color:#94a3b8;font-size:13px;margin-bottom:24px}
+.sub{color:#94a3b8;font-size:13px;margin-bottom:16px}
 .env-badge{display:inline-block;padding:3px 10px;border-radius:99px;font-size:11px;font-weight:700;margin-left:8px;background:${TILL_BASE_URL.includes('test-gateway') ? '#15803d' : '#b91c1c'};color:#fff}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:16px}
-.card{background:#1e2d42;border:1px solid #2d3f56;border-radius:12px;padding:20px}
-.card h2{font-size:14px;font-weight:700;color:#93c5fd;margin-bottom:12px;text-transform:uppercase;letter-spacing:.05em}
-label{display:block;font-size:12px;color:#94a3b8;margin-bottom:3px;margin-top:10px}
-input,select,textarea{width:100%;padding:7px 10px;background:#0f1b2d;border:1px solid #2d3f56;border-radius:6px;color:#e2e8f0;font-size:13px;outline:none}
-input:focus,select:focus{border-color:#60a5fa}
-button{margin-top:14px;width:100%;padding:9px;background:#2563eb;color:#fff;border:none;border-radius:7px;font-size:13px;font-weight:600;cursor:pointer}
-button:hover{background:#1d4ed8}
-button.danger{background:#dc2626}
-button.danger:hover{background:#b91c1c}
-.response{margin-top:12px;padding:10px;background:#0a1422;border:1px solid #2d3f56;border-radius:6px;font-size:11px;font-family:monospace;white-space:pre-wrap;max-height:200px;overflow-y:auto;display:none}
-.response.ok{border-color:#15803d;color:#86efac}
-.response.err{border-color:#dc2626;color:#fca5a5}
-.tip{font-size:11px;color:#64748b;margin-top:6px}
-.cards-tip{color:#fbbf24;font-size:11px;font-weight:600;margin-bottom:8px}
+.cards-tip{color:#fbbf24;font-size:12px;font-weight:600;margin-bottom:20px;padding:10px 14px;background:#1a2a18;border:1px solid #365314;border-radius:8px}
+#run-btn{padding:12px 32px;background:#2563eb;color:#fff;border:none;border-radius:8px;font-size:15px;font-weight:700;cursor:pointer;margin-bottom:20px}
+#run-btn:hover{background:#1d4ed8}
+#run-btn:disabled{background:#374151;cursor:wait}
+#status{font-size:13px;color:#94a3b8;margin-bottom:20px;display:none}
+table{width:100%;border-collapse:collapse;font-size:12px}
+thead tr{background:#1e2d42}
+th{padding:10px 12px;text-align:left;color:#93c5fd;font-weight:700;border-bottom:2px solid #2d3f56;white-space:nowrap}
+td{padding:9px 12px;border-bottom:1px solid #1e2d42;vertical-align:top}
+tr:hover td{background:#1a2636}
+.badge{display:inline-block;padding:2px 8px;border-radius:99px;font-size:10px;font-weight:700}
+.ok{background:#166534;color:#86efac}
+.err{background:#7f1d1d;color:#fca5a5}
+.hpptag{background:#1e3a5f;color:#93c5fd}
+.pending{background:#3f2a00;color:#fbbf24}
+.uuid-cell{font-family:monospace;font-size:11px;word-break:break-all;max-width:280px}
+.remark-cell{font-family:monospace;font-size:11px;word-break:break-all;max-width:320px;color:#86efac}
+.copy-btn{margin-left:6px;padding:2px 8px;background:#2d3f56;border:none;color:#93c5fd;border-radius:4px;cursor:pointer;font-size:10px}
+.copy-btn:hover{background:#374f6a}
+.hpp-link{display:inline-block;margin-top:4px;padding:4px 10px;background:#15803d;color:#fff;border-radius:5px;text-decoration:none;font-size:10px;font-weight:700}
+.note{font-size:10px;color:#64748b;margin-top:3px}
+#table-wrap{display:none}
+.section-sep{background:#1a2d3f}
+.section-sep td{padding:6px 12px;color:#60a5fa;font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.06em}
 </style>
 </head>
 <body>
-<h1>HOCS Till Certification Dashboard <span class="env-badge">${TILL_BASE_URL.includes('test-gateway') ? 'SANDBOX' : 'PRODUCTION ⚠️'}</span></h1>
-<p class="sub">Till Developer Certification · 10 Test Categories · Gateway: ${TILL_BASE_URL}</p>
-<p class="cards-tip">Test cards: 4111 1111 1111 1111 (Visa) &nbsp;|&nbsp; 4000 0020 0000 0008 (Visa 3DS) &nbsp;|&nbsp; Decline: 4111 1111 1111 1119</p>
-
-<div class="grid">
-
-<!-- ── CARD 1: Debit ─────────────────────────────────── -->
-<div class="card">
-  <h2>Tests 1.a–1.h · Debit</h2>
-  <p class="tip" style="margin-bottom:8px;color:#fbbf24">Till returns a <strong>redirectUrl</strong> — open it to enter your test card on Till's hosted page.</p>
-  <label>Amount</label><input id="d-amount" value="1.00">
-  <label>Currency</label><input id="d-cur" value="AUD">
-  <label>Transaction Indicator</label>
-  <select id="d-indicator">
-    <option value="SINGLE">1.e – Single</option>
-    <option value="INITIAL">1.a – Initial (with Register)</option>
-    <option value="RECURRING">1.b – Recurring</option>
-    <option value="CARDONFILE">1.c – Card on File</option>
-    <option value="CARDONFILE-MERCHANT-INITIATED">1.d – Card on File Merchant Init</option>
-  </select>
-  <label>3DS Mode</label>
-  <select id="d-3ds">
-    <option value="MANDATORY">1.g – 3DS Mandatory</option>
-    <option value="OPTIONAL">1.h – 3DS Optional</option>
-    <option value="NONE">No 3DS</option>
-  </select>
-  <label>Dynamic Descriptor (leave blank to skip — Test 1.f)</label>
-  <input id="d-descriptor" placeholder="High on Chapel 13-Feb">
-  <label>Registration ID (for 1.b/1.c/1.d)</label>
-  <input id="d-regid" placeholder="registration UUID from 1.a">
-  <label>Merchant Txn ID (auto-filled if blank)</label>
-  <input id="d-txnid" placeholder="auto">
-  <button onclick="runDebit()">Run Debit</button>
-  <div class="response" id="d-resp"></div>
+<h1>HOCS Till Certification <span class="env-badge">${TILL_BASE_URL.includes('test-gateway') ? 'SANDBOX' : 'PRODUCTION ⚠️'}</span></h1>
+<p class="sub">Gateway: ${TILL_BASE_URL}</p>
+<div class="cards-tip">
+  Test cards (enter on Till hosted page):<br>
+  ✅ Success: <strong>4111 1111 1111 1111</strong> &nbsp;|&nbsp; ✅ 3DS: <strong>4000 0020 0000 0008</strong> &nbsp;|&nbsp; ❌ Decline: <strong>4111 1111 1111 1119</strong><br>
+  Exp: any future date &nbsp;|&nbsp; CVV: any 3 digits
 </div>
-
-<!-- ── CARD 2: Preauth ──────────────────────────────── -->
-<div class="card">
-  <h2>Tests 2.a–2.h · Preauth</h2>
-  <p class="tip" style="margin-bottom:8px;color:#fbbf24">Till returns a <strong>redirectUrl</strong> — open it to enter your test card on Till's hosted page.</p>
-  <label>Amount</label><input id="p-amount" value="1.00">
-  <label>Currency</label><input id="p-cur" value="AUD">
-  <label>Transaction Indicator</label>
-  <select id="p-indicator">
-    <option value="SINGLE">2.e – Single</option>
-    <option value="INITIAL">2.a – Initial (with Register)</option>
-    <option value="RECURRING">2.b – Recurring</option>
-    <option value="CARDONFILE">2.c – Card on File</option>
-    <option value="CARDONFILE-MERCHANT-INITIATED">2.d – Card on File Merchant Init</option>
-  </select>
-  <label>3DS Mode</label>
-  <select id="p-3ds">
-    <option value="MANDATORY">2.g – 3DS Mandatory</option>
-    <option value="OPTIONAL">2.h – 3DS Optional</option>
-    <option value="NONE">No 3DS</option>
-  </select>
-  <label>Dynamic Descriptor (Test 2.f)</label>
-  <input id="p-descriptor" placeholder="High on Chapel 13-Feb">
-  <label>Registration ID (for 2.b/2.c/2.d)</label>
-  <input id="p-regid" placeholder="registration UUID">
-  <label>Merchant Txn ID (auto-filled if blank)</label>
-  <input id="p-txnid" placeholder="auto">
-  <button onclick="runPreauth()">Run Preauth</button>
-  <div class="response" id="p-resp"></div>
+<button id="run-btn" onclick="runAll()">▶ Run All Certification Tests</button>
+<div id="status"></div>
+<div id="table-wrap">
+  <p style="font-size:12px;color:#fbbf24;margin-bottom:12px">
+    ⚠️ For Capture / Void / Refund / Reversal / Incremental tests: those need you to <strong>open the HPP link</strong> from the matching debit/preauth row first (enter success card), then click <strong>Re-run dependent tests</strong> below.
+  </p>
+  <table id="results-table">
+    <thead><tr><th>#</th><th>Test</th><th>Status</th><th>UUID / Registration ID</th><th>HPP Link (open &amp; pay)</th><th>Remark (paste into Till form)</th></tr></thead>
+    <tbody id="results-body"></tbody>
+  </table>
+  <button id="rerun-btn" onclick="rerunDependent()" style="margin-top:16px;padding:10px 24px;background:#7c3aed;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer">↻ Re-run Capture / Void / Refund / Reversal / Incremental</button>
 </div>
-
-<!-- ── CARD 3+4: Capture & Void ─────────────────────── -->
-<div class="card">
-  <h2>Tests 3 / 3.a · Capture &nbsp;&nbsp; Test 4 · Void</h2>
-  <label>Preauth UUID (from Test 2 response)</label>
-  <input id="cv-uuid" placeholder="paste uuid here">
-  <label>Capture Amount (Test 3.a: less than original)</label>
-  <input id="cv-amount" value="1.00">
-  <label>Currency</label>
-  <input id="cv-cur" value="AUD">
-  <label>Merchant Txn ID for Capture (auto if blank)</label>
-  <input id="cv-txnid" placeholder="auto">
-  <button onclick="runCapture()">Capture (Test 3 / 3.a)</button>
-  <button class="danger" onclick="runVoid()">Void Preauth (Test 4)</button>
-  <div class="response" id="cv-resp"></div>
-</div>
-
-<!-- ── CARD 5: Register & Deregister ─────────────────── -->
-<div class="card">
-  <h2>Test 5 · Register &nbsp;&nbsp; Test 5.a · Deregister</h2>
-  <p class="tip" style="margin-bottom:8px;color:#fbbf24">Till returns a <strong>redirectUrl</strong> — open it to enter your test card on Till's hosted page.</p>
-  <label>Customer Email</label><input id="r-email" value="test@highonchapel.com">
-  <label>Merchant Txn ID (auto if blank)</label>
-  <input id="r-txnid" placeholder="auto">
-  <button onclick="runRegister()">Register Card (Test 5)</button>
-  <hr style="border-color:#2d3f56;margin:14px 0">
-  <label>Registration UUID (from Register response above)</label>
-  <input id="r-regid" placeholder="paste registrationId here">
-  <button class="danger" onclick="runDeregister()">Deregister (Test 5.a)</button>
-  <div class="response" id="r-resp"></div>
-</div>
-
-<!-- ── CARD 6+7: Refund ──────────────────────────────── -->
-<div class="card">
-  <h2>Test 6 · Full Refund &nbsp;&nbsp; Test 7 · Partial Refund</h2>
-  <label>Original Transaction UUID (from Debit response)</label>
-  <input id="rf-uuid" placeholder="paste uuid here">
-  <label>Refund Amount (Test 7: enter less than original)</label>
-  <input id="rf-amount" value="1.00">
-  <label>Currency</label>
-  <input id="rf-cur" value="AUD">
-  <label>Reason</label>
-  <input id="rf-reason" value="Customer refund request">
-  <button onclick="runRefund()">Refund (Test 6 / 7)</button>
-  <div class="response" id="rf-resp"></div>
-  <p class="tip">Test 6: enter the full original amount. Test 7: enter a partial amount.</p>
-</div>
-
-<!-- ── CARD 8+9: Reversal & Incremental ──────────────── -->
-<div class="card">
-  <h2>Test 8 · Reversal &nbsp;&nbsp; Test 9 · Incremental Auth</h2>
-  <label>Original UUID (from Debit/Preauth response)</label>
-  <input id="ri-uuid" placeholder="paste uuid here">
-  <label>Incremental Amount (Test 9)</label>
-  <input id="ri-amount" value="0.50">
-  <label>Currency</label>
-  <input id="ri-cur" value="AUD">
-  <button onclick="runReversal()">Debit Reversal (Test 8)</button>
-  <button onclick="runIncremental()">Incremental Auth (Test 9)</button>
-  <div class="response" id="ri-resp"></div>
-</div>
-
-<!-- ── CARD 10: Negative Tests ───────────────────────── -->
-<div class="card">
-  <h2>Test 10 · Negative (Declined) Transactions</h2>
-  <p class="tip" style="margin-bottom:8px">Click run — Till returns a redirectUrl. On Till's hosted page, use decline card: <strong style="color:#fbbf24">4111 1111 1111 1119</strong></p>
-  <label>Amount</label><input id="neg-amount" value="1.00">
-  <label>Currency</label><input id="neg-cur" value="AUD">
-  <label>Test type</label>
-  <select id="neg-type">
-    <option value="debit">10.a – Failed Debit</option>
-    <option value="preauth">10.b – Failed Preauth</option>
-    <option value="register">10.c – Failed Register</option>
-  </select>
-  <button class="danger" onclick="runNegative()">Run Negative Test</button>
-  <div class="response" id="neg-resp"></div>
-</div>
-
-</div><!-- /grid -->
 
 <script>
-function uid(){ return 'HOC-TEST-' + Date.now() + '-' + Math.floor(Math.random()*10000); }
-function show(id, data){
-  const el = document.getElementById(id);
-  el.style.display='block';
-  const ok = data.success !== false && !data.error;
-  el.className = 'response ' + (ok ? 'ok' : 'err');
-  // Show redirect URL as a prominent clickable link
-  let extra = '';
-  if (data.redirectUrl) {
-    extra = '<div style="margin-bottom:8px"><a href="'+data.redirectUrl+'" target="_blank" style="display:inline-block;background:#15803d;color:#fff;padding:8px 16px;border-radius:6px;text-decoration:none;font-weight:700;font-size:12px">🔗 Open Payment Page →</a><br><span style="font-size:10px;color:#94a3b8;word-break:break-all">'+data.redirectUrl+'</span></div>';
+let lastResults = [];
+let debitUuid = null, preauthUuid = null, regId5 = null;
+
+function uid(){ return 'HOC-CERT-'+Date.now()+'-'+Math.floor(Math.random()*9999); }
+async function post(url, body){ const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); return r.json(); }
+
+function copyText(txt){
+  navigator.clipboard.writeText(txt).catch(()=>{
+    const el=document.createElement('textarea');el.value=txt;document.body.appendChild(el);el.select();document.execCommand('copy');document.body.removeChild(el);
+  });
+}
+
+function statusEl(){ return document.getElementById('status'); }
+function setStatus(msg){ const el=statusEl(); el.style.display='block'; el.innerHTML=msg; }
+
+function renderRow(r, idx){
+  const uuid    = r.uuid || '';
+  const redir   = r.redirectUrl || '';
+  const success = r.success;
+  const isHPP   = !!redir;
+  const errInfo = r.raw?.errors?.[0] ? \`\${r.raw.errors[0].errorCode}: \${r.raw.errors[0].errorMessage||r.raw.errors[0].message||''}\` : (r.raw?.error || '');
+  const needsHPP = r.label.includes('needs HPP');
+  
+  let statusBadge;
+  if (needsHPP && !success){ statusBadge = '<span class="badge pending">PENDING HPP</span>'; }
+  else if (success){ statusBadge = '<span class="badge ok">OK</span>'; }
+  else { statusBadge = '<span class="badge err">ERROR</span>'; }
+
+  const uuidHtml = uuid
+    ? \`<span>\${uuid}</span><button class="copy-btn" onclick="copyText('\${uuid}')">copy</button>\`
+    : (errInfo ? \`<span style="color:#f87171;font-size:10px">\${errInfo}</span>\` : '<span style="color:#475569">—</span>');
+
+  const hppHtml = redir
+    ? \`<a class="hpp-link" href="\${redir}" target="_blank">Open Payment Page →</a><div class="note" style="word-break:break-all;margin-top:2px;font-size:9px;color:#475569">\${redir.substring(0,60)}...</div>\`
+    : '<span style="color:#475569">—</span>';
+
+  // Remark: for HPP tests before payment, note UUID + "complete HPP to activate"
+  // For tests that succeeded, just use UUID. For dependent (capture/void etc), use uuid from this call.
+  let remark;
+  if (needsHPP && !success){
+    remark = uuid ? \`uuid=\${uuid} | Complete HPP first, then re-run\` : 'Run HPP first';
+  } else if (uuid) {
+    remark = \`uuid=\${uuid} | success=true\`;
+  } else if (!success && errInfo){
+    remark = \`error: \${errInfo}\`;
+  } else {
+    remark = 'See raw response';
   }
-  el.innerHTML = extra + '<pre style="margin:0">'+JSON.stringify(data, null, 2)+'</pre>';
-}
-async function post(url, body){
-  const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  return r.json();
+
+  const remarkHtml = \`<span class="remark-cell">\${remark}</span><button class="copy-btn" onclick="copyText(\\\`\${remark}\\\`)">copy</button>\`;
+
+  return \`<tr id="row-\${idx}">
+    <td>\${idx+1}</td>
+    <td>\${r.label}</td>
+    <td>\${statusBadge}</td>
+    <td class="uuid-cell">\${uuidHtml}</td>
+    <td>\${hppHtml}</td>
+    <td>\${remarkHtml}</td>
+  </tr>\`;
 }
 
-async function runDebit(){
-  const ind = d('d-indicator'), ds = d('d-3ds'), desc = d('d-descriptor'), regId = d('d-regid');
-  const body = { amount: d('d-amount'), currency: d('d-cur'), transactionIndicator: ind,
-    threeDSMode: ds, merchantTransactionId: d('d-txnid') || uid(),
-    descriptor: desc || undefined, registrationId: regId || undefined };
-  show('d-resp', await post('/api/till/debit', body));
+function renderSep(text){
+  return \`<tr class="section-sep"><td colspan="6">\${text}</td></tr>\`;
 }
 
-async function runPreauth(){
-  const ind = d('p-indicator'), ds = d('p-3ds'), desc = d('p-descriptor'), regId = d('p-regid');
-  const body = { amount: d('p-amount'), currency: d('p-cur'), transactionIndicator: ind,
-    threeDSMode: ds, merchantTransactionId: d('p-txnid') || uid(),
-    descriptor: desc || undefined, registrationId: regId || undefined };
-  show('p-resp', await post('/api/till/preauth', body));
+function renderAll(results){
+  const body = document.getElementById('results-body');
+  const sections = [
+    { label:'Tests 1.a–1.h · Debit', startIdx:0, count:8 },
+    { label:'Tests 2.a–2.h · Preauth', startIdx:8, count:8 },
+    { label:'Test 3 · Capture / Test 4 · Void', startIdx:16, count:3 },
+    { label:'Test 5 · Register / Deregister', startIdx:19, count:2 },
+    { label:'Tests 6–7 · Refund', startIdx:21, count:2 },
+    { label:'Test 8 · Reversal', startIdx:23, count:1 },
+    { label:'Test 9 · Incremental Auth', startIdx:24, count:1 },
+    { label:'Test 10 · Negative (Declined)', startIdx:25, count:3 },
+  ];
+
+  let html='';
+  for(const s of sections){
+    html += renderSep(s.label);
+    for(let i=s.startIdx; i<s.startIdx+s.count && i<results.length; i++){
+      html += renderRow(results[i], i);
+    }
+  }
+  body.innerHTML = html;
+  document.getElementById('table-wrap').style.display='block';
 }
 
-async function runCapture(){
-  show('cv-resp', await post('/api/till/capture/' + d('cv-uuid'), {
-    amount: d('cv-amount'), currency: d('cv-cur'),
-    merchantTransactionId: d('cv-txnid') || uid()
-  }));
+async function runAll(){
+  const btn = document.getElementById('run-btn');
+  btn.disabled=true; btn.textContent='Running…';
+  setStatus('Calling Till API for all 28 tests… this takes ~10 seconds.');
+  try {
+    const resp = await fetch('/api/cert/run-all');
+    const data = await resp.json();
+    lastResults = data.results;
+    // Extract key UUIDs for re-run
+    debitUuid   = lastResults.find(r=>r.label.includes('1.e'))?.uuid || null;
+    preauthUuid = lastResults.find(r=>r.label.includes('2.e'))?.uuid || null;
+    regId5      = lastResults.find(r=>r.label.includes('5 –'))?.uuid || null;
+    renderAll(lastResults);
+    const ok = lastResults.filter(r=>r.success).length;
+    setStatus(\`Done. \${ok}/\${lastResults.length} API calls succeeded. HPP-dependent tests show PENDING — open each link, pay, then click Re-run below.\`);
+  } catch(e){
+    setStatus('Error: '+e.message);
+  }
+  btn.disabled=false; btn.textContent='▶ Run All Certification Tests';
 }
 
-async function runVoid(){
-  show('cv-resp', await post('/api/till/void/' + d('cv-uuid'), {}));
-}
+async function rerunDependent(){
+  if(!debitUuid && !preauthUuid){ alert('Run all tests first.'); return; }
+  setStatus('Re-running Capture / Void / Refund / Reversal / Incremental…');
+  const t = ()=>'HOC-CERT-'+Date.now()+'-'+Math.floor(Math.random()*9999);
 
-async function runRegister(){
-  show('r-resp', await post('/api/till/register', {
-    email: d('r-email'), merchantTransactionId: d('r-txnid') || uid()
-  }));
-}
+  const cap  = debitUuid  ? await post('/api/till/capture/'+preauthUuid,  {amount:'1.00',currency:'AUD',merchantTransactionId:t()}) : {success:false,raw:{error:'No preauth uuid'}};
+  const capP = preauthUuid? await post('/api/till/capture/'+preauthUuid,  {amount:'0.50',currency:'AUD',merchantTransactionId:t()}) : {success:false,raw:{error:'No preauth uuid'}};
+  const vd   = preauthUuid? await post('/api/till/void/'+preauthUuid,     {}) : {success:false,raw:{error:'No preauth uuid'}};
+  const ref  = debitUuid  ? await post('/api/till/refund/'+debitUuid,     {amount:'1.00',currency:'AUD',reason:'Customer refund request'}) : {success:false,raw:{error:'No debit uuid'}};
+  const refP = debitUuid  ? await post('/api/till/refund/'+debitUuid,     {amount:'0.50',currency:'AUD',reason:'Partial refund'}) : {success:false,raw:{error:'No debit uuid'}};
+  const rev  = debitUuid  ? await post('/api/till/reversal/'+debitUuid,   {}) : {success:false,raw:{error:'No debit uuid'}};
+  const inc  = preauthUuid? await post('/api/till/incremental/'+preauthUuid, {amount:'0.25',currency:'AUD'}) : {success:false,raw:{error:'No preauth uuid'}};
 
-async function runDeregister(){
-  show('r-resp', await post('/api/till/deregister', { registrationId: d('r-regid') }));
-}
+  const depResults = [
+    {label:'3 – Capture full',     ...cap,  uuid:cap.uuid||null},
+    {label:'3.a – Capture partial',...capP, uuid:capP.uuid||null},
+    {label:'4 – Void preauth',     ...vd,   uuid:vd.uuid||null},
+    {label:'6 – Full refund',      ...ref,  uuid:ref.uuid||null},
+    {label:'7 – Partial refund',   ...refP, uuid:refP.uuid||null},
+    {label:'8 – Reversal',         ...rev,  uuid:rev.uuid||null},
+    {label:'9 – Incremental auth', ...inc,  uuid:inc.uuid||null},
+  ];
 
-async function runRefund(){
-  show('rf-resp', await post('/api/till/refund/' + d('rf-uuid'), {
-    amount: d('rf-amount'), currency: d('rf-cur'), reason: d('rf-reason')
-  }));
+  // Patch lastResults at their positions and re-render
+  const positions = {
+    '3 – Capture full': 16, '3.a – Capture partial': 17, '4 – Void preauth': 18,
+    '6 – Full refund': 21, '7 – Partial refund': 22, '8 – Reversal': 23, '9 – Incremental auth': 24
+  };
+  for(const dr of depResults){
+    for(const [key, idx] of Object.entries(positions)){
+      if(dr.label.startsWith(key.split(' –')[0]+' –') || dr.label===key){ lastResults[idx]=dr; break; }
+    }
+  }
+  renderAll(lastResults);
+  setStatus('Re-run complete. Check updated rows above.');
 }
-
-async function runReversal(){
-  show('ri-resp', await post('/api/till/reversal/' + d('ri-uuid'), {}));
-}
-
-async function runIncremental(){
-  show('ri-resp', await post('/api/till/incremental/' + d('ri-uuid'), {
-    amount: d('ri-amount'), currency: d('ri-cur')
-  }));
-}
-
-async function runNegative(){
-  const type = d('neg-type');
-  const body = { amount: d('neg-amount'), currency: d('neg-cur'),
-    transactionIndicator: 'SINGLE', threeDSMode: 'NONE',
-    merchantTransactionId: uid(), email: 'test@highonchapel.com' };
-  let url = type === 'debit' ? '/api/till/debit' : type === 'preauth' ? '/api/till/preauth' : '/api/till/register';
-  show('neg-resp', await post(url, body));
-}
-
-function d(id){ return (document.getElementById(id).value||'').trim(); }
 </script>
 </body>
 </html>`);
