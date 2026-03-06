@@ -186,6 +186,120 @@ async function callTillAPI(method, relativeUri, body = null) {
   return { status: res.status, body: json, rawBody: text };
 }
 
+// ─── HPP Auto-Completion (for automated certification testing) ──────────────
+// Fetches the Till Hosted Payment Page, parses the HTML form, fills in test
+// card data, and submits — eliminating manual card entry for each test.
+
+async function completeHPP(redirectUrl, cardNumber = '4111111111111111') {
+  if (!redirectUrl) return { completed: false, error: 'No redirect URL' };
+  try {
+    const resp = await fetch(redirectUrl, {
+      redirect: 'follow',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+      }
+    });
+    const html = await resp.text();
+    const pageUrl = resp.url;
+    const jar = (resp.headers.raw?.()?.['set-cookie'] || []).map(c => c.split(';')[0]).join('; ');
+
+    logger.info('[HPP-AUTO] Fetched', { from: redirectUrl, landed: pageUrl, size: html.length });
+    return await _submitHPPForm(html, pageUrl, jar, cardNumber, 0);
+  } catch (err) {
+    logger.error('[HPP-AUTO] Fetch failed', { url: redirectUrl, err: err.message });
+    return { completed: false, error: err.message };
+  }
+}
+
+async function _submitHPPForm(html, pageUrl, cookies, cardNumber, depth) {
+  if (depth > 3) return { completed: false, error: 'Too many form hops' };
+
+  // Already on our success / error / cancel page?
+  if (/cert-paid|cert-error|cert-cancelled/.test(pageUrl)) {
+    return { completed: true, url: pageUrl };
+  }
+
+  // ── find the best <form> ──
+  const formRe = /<form([^>]*)>([\s\S]*?)<\/form>/gi;
+  let best = null, m;
+  while ((m = formRe.exec(html)) !== null) {
+    const attrs = m[1], body = m[2];
+    best = { attrs, body };
+    if (/card|number|pan|cvv|cvc|expir/i.test(body)) break;   // prefer card form
+  }
+  if (!best) {
+    logger.warn('[HPP-AUTO] No <form> found', { url: pageUrl, snippet: html.substring(0, 2000) });
+    return { completed: false, error: 'No form found', html: html.substring(0, 800) };
+  }
+
+  const actM = best.attrs.match(/action=["']([^"']*)/i);
+  const metM = best.attrs.match(/method=["']([^"']*)/i);
+  const action = actM ? actM[1].replace(/&amp;/g, '&') : pageUrl;
+  const method = metM ? metM[1].toUpperCase() : 'POST';
+  const submitUrl = /^https?:\/\//i.test(action) ? action : new URL(action, pageUrl).href;
+
+  // ── parse input + select fields ──
+  const fields = {};
+  const inpRe = /<input\s+([^>]*?)\/?>/gi;
+  while ((m = inpRe.exec(best.body)) !== null) {
+    const a = m[1];
+    const nm  = (a.match(/name=["']([^"']*)/i)  || [])[1];
+    const val = (a.match(/value=["']([^"']*)/i) || [])[1] || '';
+    const tp  = ((a.match(/type=["']([^"']*)/i) || [])[1] || 'text').toLowerCase();
+    if (nm && tp !== 'submit' && tp !== 'button' && tp !== 'image') fields[nm] = val;
+  }
+  const selRe = /<select[^>]*name=["']([^"']*)[^>]*>([\s\S]*?)<\/select>/gi;
+  while ((m = selRe.exec(best.body)) !== null) {
+    const nm  = m[1];
+    const sel = (m[2].match(/<option[^>]*selected[^>]*value=["']([^"']*)/i) || [])[1];
+    const fst = (m[2].match(/<option[^>]*value=["']([^"']*)/i) || [])[1];
+    if (!fields[nm]) fields[nm] = sel || fst || '';
+  }
+
+  // ── fill card data ──
+  for (const key of Object.keys(fields)) {
+    const k = key.toLowerCase();
+    if (k.includes('number') || k.includes('pan') || k === 'card' || k.includes('creditcard') || k.includes('account'))
+      fields[key] = cardNumber;
+    else if ((k.includes('exp') || k.includes('card')) && k.includes('month'))
+      fields[key] = '12';
+    else if ((k.includes('exp') || k.includes('card')) && k.includes('year'))
+      fields[key] = '2030';
+    else if (k.includes('cvv') || k.includes('cvc') || k.includes('secur') || k.includes('verif'))
+      fields[key] = '123';
+    else if (k.includes('holder') || k.includes('name_on') || (k.includes('card') && k.includes('name')))
+      fields[key] = 'Test Customer';
+  }
+
+  logger.info('[HPP-AUTO] Submitting', { url: submitUrl, fields: Object.keys(fields) });
+
+  const resp = await fetch(submitUrl, {
+    method,
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120',
+      'Referer': pageUrl,
+      ...(cookies ? { Cookie: cookies } : {})
+    },
+    body: new URLSearchParams(fields).toString(),
+    redirect: 'follow'
+  });
+
+  const nextHtml = await resp.text();
+  const nextUrl  = resp.url;
+  const nextJar  = (resp.headers.raw?.()?.['set-cookie'] || []).map(c => c.split(';')[0]).join('; ') || cookies;
+
+  logger.info('[HPP-AUTO] Result', { url: nextUrl, status: resp.status });
+
+  // terminal?
+  if (/cert-paid|cert-error|cert-cancelled/.test(nextUrl)) {
+    return { completed: true, url: nextUrl };
+  }
+  // another form (3DS challenge etc.) → recurse
+  return _submitHPPForm(nextHtml, nextUrl, nextJar, cardNumber, depth + 1);
+}
+
 // ─── Shopify Admin API Client (2026 Client Credentials Grant) ───────────────
 // Tokens are short-lived (24 hrs). We cache and auto-refresh before expiry.
 
@@ -1152,11 +1266,10 @@ app.get('/cert-error', (_req, res) => {
 
 app.get('/api/cert/run-all', async (_req, res) => {
   const ts = () => `HOC-CERT-${Date.now()}-${Math.floor(Math.random()*9999)}`;
-  const results = [];
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
   async function run(label, method, path, body = {}) {
-    await sleep(12000); // throttle: Till sandbox rate limit
+    await sleep(12000);
     try {
       const r = await callTillAPI(method, path, body);
       const d = r.body || {};
@@ -1166,75 +1279,82 @@ app.get('/api/cert/run-all', async (_req, res) => {
     }
   }
 
+  async function runHPP(label, method, path, body, cardNumber = '4111111111111111') {
+    const r = await run(label, method, path, body);
+    if (r.redirectUrl) {
+      const hpp = await completeHPP(r.redirectUrl, cardNumber);
+      r.hppCompleted = hpp.completed;
+      r.hppError     = hpp.error;
+      if (!hpp.completed) r.needsManual = true;
+      logger.info('[CERT] HPP auto', { label, completed: hpp.completed, error: hpp.error });
+    }
+    return r;
+  }
+
   const BASE  = `/api/v3/transaction/${TILL_API_KEY}`;
   const CUST  = { firstName:'Test', lastName:'Customer', email:'cert@highonchapel.com', ipAddress:'127.0.0.1', billingCountry:'AU' };
   const URLS  = { successUrl: CERT_SUCCESS_URL, cancelUrl: CERT_CANCEL_URL, errorUrl: CERT_ERROR_URL, callbackUrl: CALLBACK_URL };
+  const FAIL  = (label, reason) => ({ label, success: false, uuid: null, redirectUrl: null, raw: { error: reason } });
 
-  // ── Tests 1.e/1.g/1.h — plain debit (SINGLE, no 3DS / mandatory / optional)
-  const d_1e = await run('1.e – Debit SINGLE no 3DS',       'POST', BASE+'/debit',       { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'HOC Cert 1.e', customer:CUST, ...URLS });
-  const d_1g = await run('1.g – Debit SINGLE 3DS MANDATORY','POST', BASE+'/debit',       { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'HOC Cert 1.g', customer:CUST, ...URLS, extraData:{'3dsecure':'MANDATORY'}, threeDSecureData:{'3dsecure':'MANDATORY',channel:'02',authenticationIndicator:'01',cardholderAuthenticationMethod:'01',challengeIndicator:'02'} });
-  const d_1h = await run('1.h – Debit SINGLE 3DS OPTIONAL', 'POST', BASE+'/debit',       { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'HOC Cert 1.h', customer:CUST, ...URLS, extraData:{'3dsecure':'OPTIONAL'}, threeDSecureData:{'3dsecure':'OPTIONAL',channel:'02',authenticationIndicator:'01',cardholderAuthenticationMethod:'01',challengeIndicator:'03'} });
-  const d_1f = await run('1.f – Debit SINGLE Dynamic Desc', 'POST', BASE+'/debit',       { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'High on Chapel 13-Feb', customer:CUST, ...URLS });
+  // ═══ Phase 1: HPP transactions — create + auto-complete payment pages ═══
+  const d_1a = await runHPP('1.a – Debit INITIAL',               'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'INITIAL', description:'HOC Cert 1.a', customer:CUST, ...URLS });
+  const d_1e = await runHPP('1.e – Debit SINGLE no 3DS',         'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE',  description:'HOC Cert 1.e', customer:CUST, ...URLS });
+  const d_1f = await runHPP('1.f – Debit SINGLE Dynamic Desc',   'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE',  description:'High on Chapel 13-Feb', customer:CUST, ...URLS });
+  const d_1g = await runHPP('1.g – Debit SINGLE 3DS MANDATORY',  'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE',  description:'HOC Cert 1.g', customer:CUST, ...URLS, extraData:{'3dsecure':'MANDATORY'}, threeDSecureData:{'3dsecure':'MANDATORY',channel:'02',authenticationIndicator:'01',cardholderAuthenticationMethod:'01',challengeIndicator:'02'} }, '4000002000000008');
+  const d_1h = await runHPP('1.h – Debit SINGLE 3DS OPTIONAL',   'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE',  description:'HOC Cert 1.h', customer:CUST, ...URLS, extraData:{'3dsecure':'OPTIONAL'}, threeDSecureData:{'3dsecure':'OPTIONAL',channel:'02',authenticationIndicator:'01',cardholderAuthenticationMethod:'01',challengeIndicator:'03'} });
 
-  // ── Test 1.a — INITIAL debit (starts registration, returns registrationId)
-  const d_1a = await run('1.a – Debit INITIAL',              'POST', BASE+'/debit',       { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'INITIAL', description:'HOC Cert 1.a', customer:CUST, ...URLS });
-  const refUuidFromDebit = d_1a.uuid || null;
+  const p_2a = await runHPP('2.a – Preauth INITIAL',              'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'INITIAL', description:'HOC Cert 2.a', customer:CUST, ...URLS });
+  const p_2e = await runHPP('2.e – Preauth SINGLE no 3DS',        'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE',  description:'HOC Cert 2.e', customer:CUST, ...URLS });
+  const p_2f = await runHPP('2.f – Preauth SINGLE Dynamic Desc',  'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE',  description:'High on Chapel 13-Feb', customer:CUST, ...URLS });
+  const p_2g = await runHPP('2.g – Preauth SINGLE 3DS MANDATORY', 'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE',  description:'HOC Cert 2.g', customer:CUST, ...URLS, extraData:{'3dsecure':'MANDATORY'}, threeDSecureData:{'3dsecure':'MANDATORY',channel:'02',authenticationIndicator:'01',cardholderAuthenticationMethod:'01',challengeIndicator:'02'} }, '4000002000000008');
+  const p_2h = await runHPP('2.h – Preauth SINGLE 3DS OPTIONAL',  'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE',  description:'HOC Cert 2.h', customer:CUST, ...URLS, extraData:{'3dsecure':'OPTIONAL'}, threeDSecureData:{'3dsecure':'OPTIONAL',channel:'02',authenticationIndicator:'01',cardholderAuthenticationMethod:'01',challengeIndicator:'03'} });
 
-  // ── Tests 1.b/1.c/1.d — card-on-file debits (referenceUuid = UUID from 1.a INITIAL)
-  const d_1b = await run('1.b – Debit RECURRING',                 'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'RECURRING',                    description:'HOC Cert 1.b', customer:CUST, callbackUrl: CALLBACK_URL, ...(refUuidFromDebit ? {referenceUuid:refUuidFromDebit}:{}) });
-  const d_1c = await run('1.c – Debit CARDONFILE',                'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE',                   description:'HOC Cert 1.c', customer:CUST, callbackUrl: CALLBACK_URL, ...(refUuidFromDebit ? {referenceUuid:refUuidFromDebit}:{}) });
-  const d_1d = await run('1.d – Debit CARDONFILE-MERCHANT-INIT',  'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE-MERCHANT-INITIATED', description:'HOC Cert 1.d', customer:CUST, callbackUrl: CALLBACK_URL, ...(refUuidFromDebit ? {referenceUuid:refUuidFromDebit}:{}) });
-  // These three will fail (1006) until the user completes HPP on 1.a — mark as HPP-dependent
-  d_1b.needsHPP = true; d_1c.needsHPP = true; d_1d.needsHPP = true;
+  const t5   = await runHPP('5 – Register card', 'POST', BASE+'/register', { merchantTransactionId:ts(), customer:CUST, ...URLS });
 
-  results.push(d_1a, d_1b, d_1c, d_1d, d_1e, d_1f, d_1g, d_1h);
+  // ═══ Phase 2: Settle wait — give Till time to process HPP completions ═══
+  logger.info('[CERT] Waiting 15s for HPP settlements…');
+  await sleep(15000);
 
-  // ── Tests 2.a-2.h — Preauth equivalents
-  const p_2e = await run('2.e – Preauth SINGLE no 3DS',       'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'HOC Cert 2.e', customer:CUST, ...URLS });
-  const p_2g = await run('2.g – Preauth SINGLE 3DS MANDATORY','POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'HOC Cert 2.g', customer:CUST, ...URLS, extraData:{'3dsecure':'MANDATORY'}, threeDSecureData:{'3dsecure':'MANDATORY',channel:'02',authenticationIndicator:'01',cardholderAuthenticationMethod:'01',challengeIndicator:'02'} });
-  const p_2h = await run('2.h – Preauth SINGLE 3DS OPTIONAL', 'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'HOC Cert 2.h', customer:CUST, ...URLS, extraData:{'3dsecure':'OPTIONAL'}, threeDSecureData:{'3dsecure':'OPTIONAL',channel:'02',authenticationIndicator:'01',cardholderAuthenticationMethod:'01',challengeIndicator:'03'} });
-  const p_2f = await run('2.f – Preauth SINGLE Dynamic Desc', 'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'High on Chapel 13-Feb', customer:CUST, ...URLS });
-  const p_2a = await run('2.a – Preauth INITIAL',              'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'INITIAL', description:'HOC Cert 2.a', customer:CUST, ...URLS });
-  const refUuidFromPreauth = p_2a.uuid || null;
-  const p_2b = await run('2.b – Preauth RECURRING',                 'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'RECURRING',                    description:'HOC Cert 2.b', customer:CUST, callbackUrl: CALLBACK_URL, ...(refUuidFromPreauth ? {referenceUuid:refUuidFromPreauth}:{}) });
-  const p_2c = await run('2.c – Preauth CARDONFILE',                'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE',                   description:'HOC Cert 2.c', customer:CUST, callbackUrl: CALLBACK_URL, ...(refUuidFromPreauth ? {referenceUuid:refUuidFromPreauth}:{}) });
-  const p_2d = await run('2.d – Preauth CARDONFILE-MERCHANT-INIT',  'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE-MERCHANT-INITIATED', description:'HOC Cert 2.d', customer:CUST, callbackUrl: CALLBACK_URL, ...(refUuidFromPreauth ? {referenceUuid:refUuidFromPreauth}:{}) });
-  // These three will fail (1006) until the user completes HPP on 2.a — mark as HPP-dependent
-  p_2b.needsHPP = true; p_2c.needsHPP = true; p_2d.needsHPP = true;
+  // ═══ Phase 3: RECURRING / CARDONFILE (server-to-server, need 1.a / 2.a HPP done) ═══
+  const refD = d_1a.uuid, refPA = p_2a.uuid;
+  const d_1b = await run('1.b – Debit RECURRING',                 'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'RECURRING',                    description:'HOC Cert 1.b', customer:CUST, callbackUrl: CALLBACK_URL, ...(refD ? {referenceUuid:refD}:{}) });
+  const d_1c = await run('1.c – Debit CARDONFILE',                'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE',                   description:'HOC Cert 1.c', customer:CUST, callbackUrl: CALLBACK_URL, ...(refD ? {referenceUuid:refD}:{}) });
+  const d_1d = await run('1.d – Debit CARDONFILE-MERCHANT-INIT',  'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE-MERCHANT-INITIATED', description:'HOC Cert 1.d', customer:CUST, callbackUrl: CALLBACK_URL, ...(refD ? {referenceUuid:refD}:{}) });
+  const p_2b = await run('2.b – Preauth RECURRING',                'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'RECURRING',                    description:'HOC Cert 2.b', customer:CUST, callbackUrl: CALLBACK_URL, ...(refPA ? {referenceUuid:refPA}:{}) });
+  const p_2c = await run('2.c – Preauth CARDONFILE',               'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE',                   description:'HOC Cert 2.c', customer:CUST, callbackUrl: CALLBACK_URL, ...(refPA ? {referenceUuid:refPA}:{}) });
+  const p_2d = await run('2.d – Preauth CARDONFILE-MERCHANT-INIT', 'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE-MERCHANT-INITIATED', description:'HOC Cert 2.d', customer:CUST, callbackUrl: CALLBACK_URL, ...(refPA ? {referenceUuid:refPA}:{}) });
 
-  results.push(p_2a, p_2b, p_2c, p_2d, p_2e, p_2f, p_2g, p_2h);
+  // ═══ Phase 4: Downstream tests (need HPP completed on source transactions) ═══
+  const cap  = p_2e.uuid && p_2e.hppCompleted ? await run('3 – Capture full',     'POST', BASE+'/capture',                  { merchantTransactionId:ts(), referenceUuid:p_2e.uuid, amount:'1.00', currency:'AUD' })                              : FAIL('3 – Capture full',     'Preauth 2.e HPP not completed');
+  const capP = p_2f.uuid && p_2f.hppCompleted ? await run('3.a – Capture partial', 'POST', BASE+'/capture',                  { merchantTransactionId:ts(), referenceUuid:p_2f.uuid, amount:'0.50', currency:'AUD' })                              : FAIL('3.a – Capture partial', 'Preauth 2.f HPP not completed');
+  const vd   = p_2g.uuid && p_2g.hppCompleted ? await run('4 – Void preauth',     'POST', BASE+'/void',                     { merchantTransactionId:ts(), referenceUuid:p_2g.uuid })                                                             : FAIL('4 – Void preauth',     'Preauth 2.g HPP not completed');
+  const dereg= t5.uuid   && t5.hppCompleted   ? await run('5.a – Deregister',     'POST', BASE+'/deregister',               { merchantTransactionId:ts(), referenceUuid:t5.uuid })                                                               : FAIL('5.a – Deregister',     'Register (5) HPP not completed');
+  const reful = d_1e.uuid && d_1e.hppCompleted ? await run('6 – Full refund',      'POST', BASE+'/refund',                   { merchantTransactionId:ts(), referenceUuid:d_1e.uuid, amount:'1.00', currency:'AUD', description:'Full refund' })    : FAIL('6 – Full refund',      'Debit 1.e HPP not completed');
+  const refPa = d_1f.uuid && d_1f.hppCompleted ? await run('7 – Partial refund',   'POST', BASE+'/refund',                   { merchantTransactionId:ts(), referenceUuid:d_1f.uuid, amount:'0.50', currency:'AUD', description:'Partial refund' }) : FAIL('7 – Partial refund',   'Debit 1.f HPP not completed');
+  const rev  = d_1g.uuid && d_1g.hppCompleted ? await run('8 – Reversal',         'POST', BASE+'/reversal',                 { merchantTransactionId:ts(), referenceUuid:d_1g.uuid })                                                             : FAIL('8 – Reversal',         'Debit 1.g HPP not completed');
+  const inc  = p_2h.uuid && p_2h.hppCompleted ? await run('9 – Incremental auth', 'POST', BASE+'/incrementalAuthorization', { merchantTransactionId:ts(), referenceUuid:p_2h.uuid, amount:'0.25', currency:'AUD' })                              : FAIL('9 – Incremental auth', 'Preauth 2.h HPP not completed');
 
-  // Downstream tests (Capture / Void / Refund / Reversal / Incremental) require HPP
-  // completion first. We skip their API calls during run-all to avoid corrupting the
-  // HPP payment sessions on the source transactions (1.e, 2.e, etc.).
-  // They are executed by Re-run after the user completes all payment pages.
-  const hppPlaceholder = (label) => ({ label, success: false, uuid: null, redirectUrl: null, raw: { info: 'Complete all payment pages first, then click Re-run' }, needsHPP: true });
+  // ═══ Phase 5: Negative tests (decline card — HPP auto-completed) ═══
+  const t10a = await runHPP('10.a – Negative debit',    'POST', BASE+'/debit',        { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'HOC Cert 10.a Negative', customer:CUST, ...URLS }, '4111111111111119');
+  const t10b = await runHPP('10.b – Negative preauth',  'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'HOC Cert 10.b Negative', customer:CUST, ...URLS }, '4111111111111119');
+  const t10c = await runHPP('10.c – Negative register', 'POST', BASE+'/register',     { merchantTransactionId:ts(), customer:CUST, ...URLS }, '4111111111111119');
 
-  results.push(
-    hppPlaceholder('3 – Capture full (needs HPP done first)'),
-    hppPlaceholder('3.a – Capture partial (needs HPP done)'),
-    hppPlaceholder('4 – Void preauth (needs HPP done)')
-  );
+  // ═══ Assemble results in display order (must match dashboard sections) ═══
+  const results = [
+    d_1a, d_1b, d_1c, d_1d, d_1e, d_1f, d_1g, d_1h,   // 0-7   Debits
+    p_2a, p_2b, p_2c, p_2d, p_2e, p_2f, p_2g, p_2h,   // 8-15  Preauths
+    cap, capP, vd,                                       // 16-18 Capture/Void
+    t5, dereg,                                           // 19-20 Register/Deregister
+    reful, refPa,                                        // 21-22 Refunds
+    rev,                                                 // 23    Reversal
+    inc,                                                 // 24    Incremental
+    t10a, t10b, t10c                                     // 25-27 Negatives
+  ];
 
-  // ── Test 5 — standalone register (needs API call for redirectUrl)
-  const t5  = await run('5 – Register card',  'POST', BASE+'/register',   { merchantTransactionId:ts(), customer:CUST, ...URLS });
-  results.push(t5, hppPlaceholder('5.a – Deregister (needs HPP done)'));
-
-  results.push(
-    hppPlaceholder('6 – Full refund (needs HPP done)'),
-    hppPlaceholder('7 – Partial refund (needs HPP done)')
-  );
-  results.push(hppPlaceholder('8 – Reversal (needs HPP done)'));
-  results.push(hppPlaceholder('9 – Incremental auth (needs HPP done)'));
-
-  // ── Test 10 — negative tests (use SINGLE/no 3DS — user enters decline card on HPP)
-  const t10a = await run('10.a – Negative debit',    'POST', BASE+'/debit',        { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'HOC Cert 10.a Negative', customer:CUST, ...URLS });
-  const t10b = await run('10.b – Negative preauth',  'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'HOC Cert 10.b Negative', customer:CUST, ...URLS });
-  const t10c = await run('10.c – Negative register', 'POST', BASE+'/register',     { merchantTransactionId:ts(), customer:CUST, ...URLS });
-  results.push(t10a, t10b, t10c);
-
-  logger.info('[CERT] run-all completed', { total: results.length });
-  res.json({ ok: true, results });
+  const hppAuto   = results.filter(r => r.hppCompleted).length;
+  const hppFailed = results.filter(r => r.needsManual).length;
+  logger.info('[CERT] run-all done', { total: results.length, hppAuto, hppFailed });
+  res.json({ ok: true, results, hppAuto, hppFailed });
 });
 
 // ENDPOINT: GET /
@@ -1306,7 +1426,7 @@ tr:hover td{background:#1a2636}
 <div id="status"></div>
 <div id="table-wrap">
   <p style="font-size:12px;color:#fbbf24;margin-bottom:12px">
-    ⚠️ After Run All: Open &amp; complete <strong>ALL</strong> "Open Payment Page" links (success card for tests 1–9, decline card for 10.a–10.c). Each Capture/Void/Refund/Reversal/Incremental uses a different source transaction. Then click <strong>↻ Re-run</strong> below.
+    ⚠️ HPP payment pages are auto-completed server-side. If any HPP tests fail, use the manual "Open Payment Page" links as fallback, then click <strong>↻ Re-run</strong>.
   </p>
   <table id="results-table">
     <thead><tr><th>#</th><th>Test</th><th>Status</th><th>UUID / Registration ID</th><th>HPP Link (open &amp; pay)</th><th>Remark (paste into Till form)</th></tr></thead>
@@ -1437,18 +1557,17 @@ function renderAll(results){
 async function runAll(){
   const btn = document.getElementById('run-btn');
   btn.disabled=true; btn.textContent='Running…';
-  setStatus('Calling Till API for all 28 tests… ~4 minutes (throttled to avoid rate limit).');
+  setStatus('Fully automated: creating transactions, auto-completing HPP pages, running downstream tests… ~7 minutes.');
   startTimer();
-  showProgress('Running 28 tests on Till sandbox…', 0);
-  // Animate a time-based estimate bar (~220s expected)
-  const estMs = 260000; const t0 = Date.now();
-  const pInt = setInterval(()=>{ const pct=Math.min(((Date.now()-t0)/estMs)*95,95); showProgress('Running 28 tests on Till sandbox…',pct); },400);
+  showProgress('Running all 28 tests (HPP auto-completed)…', 0);
+  const estMs = 450000; const t0 = Date.now();
+  const pInt = setInterval(()=>{ const pct=Math.min(((Date.now()-t0)/estMs)*95,95); showProgress('Running all 28 tests (HPP auto-completed)…',pct); },400);
   try {
     const resp = await fetch('/api/cert/run-all');
     clearInterval(pInt); showProgress('Processing results…',100);
     const data = await resp.json();
     lastResults = data.results;
-    // Extract key UUIDs for re-run
+    // Extract key UUIDs for manual re-run fallback
     debitUuid          = lastResults.find(r=>r.label.includes('1.e'))?.uuid || null;
     debitUuid2         = lastResults.find(r=>r.label.includes('1.f'))?.uuid || null;
     debitUuid3         = lastResults.find(r=>r.label.includes('1.g'))?.uuid || null;
@@ -1461,7 +1580,11 @@ async function runAll(){
     preauthInitialUuid = lastResults.find(r=>r.label.includes('2.a'))?.uuid || null;
     renderAll(lastResults);
     const ok = lastResults.filter(r=>r.success).length;
-    setStatus(\`Done. \${ok}/\${lastResults.length} API calls succeeded. HPP-dependent tests show PENDING — open each link, pay, then click Re-run below.\`);
+    const hppAuto = data.hppAuto || 0;
+    const hppFailed = data.hppFailed || 0;
+    let msg = \`Done. \${ok}/\${lastResults.length} tests passed. HPP auto-completed: \${hppAuto}.\`;
+    if (hppFailed > 0) msg += \` ⚠️ \${hppFailed} HPP failed — open those payment links manually, then click Re-run.\`;
+    setStatus(msg);
   } catch(e){
     setStatus('Error: '+e.message);
   }
