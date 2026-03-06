@@ -1294,6 +1294,14 @@ tr:hover td{background:#1a2636}
 #table-wrap{display:none}
 .section-sep{background:#1a2d3f}
 .section-sep td{padding:6px 12px;color:#60a5fa;font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.06em}
+/* ── Progress bar ──────────────────────────────────────────── */
+#progress-wrap{display:none;margin-bottom:20px}
+.progress-outer{height:12px;background:#1e2d42;border-radius:6px;overflow:hidden;position:relative}
+.progress-inner{height:100%;width:0%;border-radius:6px;background:linear-gradient(90deg,#2563eb 0%,#60a5fa 50%,#2563eb 100%);background-size:200% 100%;animation:shimmer 1.5s ease-in-out infinite;transition:width .6s cubic-bezier(.25,.8,.25,1)}
+@keyframes shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
+.progress-info{display:flex;justify-content:space-between;align-items:center;margin-top:6px;font-size:11px;color:#94a3b8}
+.progress-info .step{color:#60a5fa;font-weight:600}
+.progress-info .elapsed{font-variant-numeric:tabular-nums}
 </style>
 </head>
 <body>
@@ -1305,6 +1313,10 @@ tr:hover td{background:#1a2636}
   Exp: any future date &nbsp;|&nbsp; CVV: any 3 digits
 </div>
 <button id="run-btn" onclick="runAll()">▶ Run All Certification Tests</button>
+<div id="progress-wrap">
+  <div class="progress-outer"><div class="progress-inner" id="progress-bar"></div></div>
+  <div class="progress-info"><span class="step" id="progress-step"></span><span class="elapsed" id="progress-time">0:00</span></div>
+</div>
 <div id="status"></div>
 <div id="table-wrap">
   <p style="font-size:12px;color:#fbbf24;margin-bottom:12px">
@@ -1334,6 +1346,25 @@ function copyText(txt){
 
 function statusEl(){ return document.getElementById('status'); }
 function setStatus(msg){ const el=statusEl(); el.style.display='block'; el.innerHTML=msg; }
+
+/* ── Progress bar helpers ── */
+let progressTimer = null;
+function showProgress(stepText, pct){
+  const w = document.getElementById('progress-wrap'); w.style.display='block';
+  document.getElementById('progress-bar').style.width = Math.min(pct,100)+'%';
+  document.getElementById('progress-step').textContent = stepText;
+}
+function hideProgress(){ document.getElementById('progress-wrap').style.display='none'; clearInterval(progressTimer); progressTimer=null; }
+function startTimer(){
+  const t0 = Date.now();
+  const el = document.getElementById('progress-time');
+  el.textContent = '0:00';
+  clearInterval(progressTimer);
+  progressTimer = setInterval(()=>{
+    const s = Math.floor((Date.now()-t0)/1000);
+    el.textContent = Math.floor(s/60)+':'+String(s%60).padStart(2,'0');
+  }, 500);
+}
 
 function renderRow(r, idx){
   const uuid    = r.uuid || '';
@@ -1418,8 +1449,14 @@ async function runAll(){
   const btn = document.getElementById('run-btn');
   btn.disabled=true; btn.textContent='Running…';
   setStatus('Calling Till API for all 28 tests… ~4 minutes (throttled to avoid rate limit).');
+  startTimer();
+  showProgress('Running 28 tests on Till sandbox…', 0);
+  // Animate a time-based estimate bar (~220s expected)
+  const estMs = 220000; const t0 = Date.now();
+  const pInt = setInterval(()=>{ const pct=Math.min(((Date.now()-t0)/estMs)*95,95); showProgress('Running 28 tests on Till sandbox…',pct); },400);
   try {
     const resp = await fetch('/api/cert/run-all');
+    clearInterval(pInt); showProgress('Processing results…',100);
     const data = await resp.json();
     lastResults = data.results;
     // Extract key UUIDs for re-run
@@ -1434,6 +1471,7 @@ async function runAll(){
   } catch(e){
     setStatus('Error: '+e.message);
   }
+  hideProgress();
   btn.disabled=false; btn.textContent='▶ Run All Certification Tests';
 }
 
@@ -1443,34 +1481,50 @@ async function rerunDependent(){
   const btn = document.getElementById('rerun-btn');
   btn.disabled = true;
   setStatus('Re-running RECURRING/CARDONFILE + Capture / Void / Refund / Reversal / Incremental… ~2 minutes.');
+  startTimer();
+  const totalSteps = 13; let curStep = 0;
+  function stepProgress(label){ curStep++; showProgress(curStep+'/'+totalSteps+' · '+label, (curStep/totalSteps)*100); }
 
   // ── RECURRING / CARDONFILE (needs 1.a / 2.a HPP completed first)
+  stepProgress('Debit RECURRING (1.b)');
   const rec1b = debitInitialUuid   ? await post('/api/till/debit',   {transactionIndicator:'RECURRING',                    referenceUuid:debitInitialUuid,   amount:'1.00',currency:'AUD',merchantTransactionId:t(),descriptor:'HOC Cert 1.b'}) : {success:false,raw:{error:'No initial debit uuid — complete HPP on row 1 (1.a) first'}};
   await sleep(8000);
+  stepProgress('Debit CARDONFILE (1.c)');
   const cof1c = debitInitialUuid   ? await post('/api/till/debit',   {transactionIndicator:'CARDONFILE',                   referenceUuid:debitInitialUuid,   amount:'1.00',currency:'AUD',merchantTransactionId:t(),descriptor:'HOC Cert 1.c'}) : {success:false,raw:{error:'No initial debit uuid — complete HPP on row 1 (1.a) first'}};
   await sleep(8000);
+  stepProgress('Debit CARDONFILE-MI (1.d)');
   const cof1d = debitInitialUuid   ? await post('/api/till/debit',   {transactionIndicator:'CARDONFILE-MERCHANT-INITIATED', referenceUuid:debitInitialUuid,   amount:'1.00',currency:'AUD',merchantTransactionId:t(),descriptor:'HOC Cert 1.d'}) : {success:false,raw:{error:'No initial debit uuid — complete HPP on row 1 (1.a) first'}};
   await sleep(8000);
+  stepProgress('Preauth RECURRING (2.b)');
   const rec2b = preauthInitialUuid ? await post('/api/till/preauth', {transactionIndicator:'RECURRING',                    referenceUuid:preauthInitialUuid, amount:'1.00',currency:'AUD',merchantTransactionId:t(),descriptor:'HOC Cert 2.b'}) : {success:false,raw:{error:'No initial preauth uuid — complete HPP on row 9 (2.a) first'}};
   await sleep(8000);
+  stepProgress('Preauth CARDONFILE (2.c)');
   const cof2c = preauthInitialUuid ? await post('/api/till/preauth', {transactionIndicator:'CARDONFILE',                   referenceUuid:preauthInitialUuid, amount:'1.00',currency:'AUD',merchantTransactionId:t(),descriptor:'HOC Cert 2.c'}) : {success:false,raw:{error:'No initial preauth uuid — complete HPP on row 9 (2.a) first'}};
   await sleep(8000);
+  stepProgress('Preauth CARDONFILE-MI (2.d)');
   const cof2d = preauthInitialUuid ? await post('/api/till/preauth', {transactionIndicator:'CARDONFILE-MERCHANT-INITIATED', referenceUuid:preauthInitialUuid, amount:'1.00',currency:'AUD',merchantTransactionId:t(),descriptor:'HOC Cert 2.d'}) : {success:false,raw:{error:'No initial preauth uuid — complete HPP on row 9 (2.a) first'}};
   await sleep(8000);
 
   // ── Capture / Void / Refund / Reversal / Incremental (needs 1.e / 2.e HPP completed first)
+  stepProgress('Capture full (3)');
   const cap  = preauthUuid ? await post('/api/till/capture/'+preauthUuid,  {amount:'1.00',currency:'AUD',merchantTransactionId:t()}) : {success:false,raw:{error:'No preauth uuid'}};
   await sleep(8000);
+  stepProgress('Capture partial (3a)');
   const capP = preauthUuid ? await post('/api/till/capture/'+preauthUuid,  {amount:'0.50',currency:'AUD',merchantTransactionId:t()}) : {success:false,raw:{error:'No preauth uuid'}};
   await sleep(8000);
+  stepProgress('Void preauth (4)');
   const vd   = preauthUuid ? await post('/api/till/void/'+preauthUuid,     {}) : {success:false,raw:{error:'No preauth uuid'}};
   await sleep(8000);
+  stepProgress('Full refund (6)');
   const ref  = debitUuid   ? await post('/api/till/refund/'+debitUuid,     {amount:'1.00',currency:'AUD',reason:'Customer refund request'}) : {success:false,raw:{error:'No debit uuid'}};
   await sleep(8000);
+  stepProgress('Partial refund (7)');
   const refP = debitUuid   ? await post('/api/till/refund/'+debitUuid,     {amount:'0.50',currency:'AUD',reason:'Partial refund'}) : {success:false,raw:{error:'No debit uuid'}};
   await sleep(8000);
+  stepProgress('Reversal (8)');
   const rev  = debitUuid   ? await post('/api/till/reversal/'+debitUuid,   {}) : {success:false,raw:{error:'No debit uuid'}};
   await sleep(8000);
+  stepProgress('Incremental auth (9)');
   const inc  = preauthUuid ? await post('/api/till/incremental/'+preauthUuid, {amount:'0.25',currency:'AUD'}) : {success:false,raw:{error:'No preauth uuid'}};
 
   const depResults = [
@@ -1502,6 +1556,7 @@ async function rerunDependent(){
     }
   }
   renderAll(lastResults);
+  hideProgress();
   btn.disabled = false;
   setStatus('Re-run complete. Check updated rows above.');
 }
