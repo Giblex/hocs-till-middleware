@@ -1204,44 +1204,28 @@ app.get('/api/cert/run-all', async (_req, res) => {
 
   results.push(p_2a, p_2b, p_2c, p_2d, p_2e, p_2f, p_2g, p_2h);
 
-  // Each downstream test uses a DIFFERENT preauth UUID so they don't conflict
-  const preauthUuid  = p_2e.uuid || p_2a.uuid || null; // Capture full (3)
-  const preauthUuid2 = p_2f.uuid || null;              // Capture partial (3.a)
-  const preauthUuid3 = p_2g.uuid || null;              // Void (4)
-  const preauthUuid4 = p_2h.uuid || null;              // Incremental auth (9)
+  // Downstream tests (Capture / Void / Refund / Reversal / Incremental) require HPP
+  // completion first. We skip their API calls during run-all to avoid corrupting the
+  // HPP payment sessions on the source transactions (1.e, 2.e, etc.).
+  // They are executed by Re-run after the user completes all payment pages.
+  const hppPlaceholder = (label) => ({ label, success: false, uuid: null, redirectUrl: null, raw: { info: 'Complete all payment pages first, then click Re-run' }, needsHPP: true });
 
-  const t3  = await run('3 – Capture full (needs HPP done first)',   'POST', BASE+'/capture',                 { merchantTransactionId:ts(), referenceUuid: preauthUuid || 'PENDING', amount:'1.00', currency:'AUD' });
-  const t3a = await run('3.a – Capture partial (needs HPP done)',    'POST', BASE+'/capture',                 { merchantTransactionId:ts(), referenceUuid: preauthUuid2 || preauthUuid || 'PENDING', amount:'0.50', currency:'AUD' });
-  const t4  = await run('4 – Void preauth (needs HPP done)',         'POST', BASE+'/void',                   { merchantTransactionId:ts(), referenceUuid: preauthUuid3 || preauthUuid || 'PENDING' });
+  results.push(
+    hppPlaceholder('3 – Capture full (needs HPP done first)'),
+    hppPlaceholder('3.a – Capture partial (needs HPP done)'),
+    hppPlaceholder('4 – Void preauth (needs HPP done)')
+  );
 
-  results.push(t3, t3a, t4);
-
-  // ── Test 5 — standalone register
+  // ── Test 5 — standalone register (needs API call for redirectUrl)
   const t5  = await run('5 – Register card',  'POST', BASE+'/register',   { merchantTransactionId:ts(), customer:CUST, ...URLS });
-  const regId5 = t5.uuid || t5.raw?.registrationId || null;
-  const t5a = regId5
-    ? await run('5.a – Deregister (needs HPP done)',  'POST', BASE+'/deregister',  { merchantTransactionId:ts(), referenceUuid: regId5 })
-    : { label:'5.a – Deregister (needs HPP done)', success:false, uuid:null, redirectUrl:null, raw:{ error:'No registrationId from Test 5' } };
-  t5a.needsHPP = true;
+  results.push(t5, hppPlaceholder('5.a – Deregister (needs HPP done)'));
 
-  results.push(t5, t5a);
-
-  // Each downstream test uses a DIFFERENT debit UUID so they don't conflict
-  const debitUuid  = d_1e.uuid || null;               // Full refund (6)
-  const debitUuid2 = d_1f.uuid || null;               // Partial refund (7)
-  const debitUuid3 = d_1g.uuid || null;               // Reversal (8)
-  const t6  = await run('6 – Full refund (needs HPP done)',    'POST', BASE+'/refund',   { merchantTransactionId:ts(), referenceUuid: debitUuid || 'PENDING', amount:'1.00', currency:'AUD', description:'Customer refund request' });
-  const t7  = await run('7 – Partial refund (needs HPP done)', 'POST', BASE+'/refund',   { merchantTransactionId:ts(), referenceUuid: debitUuid2 || debitUuid || 'PENDING', amount:'0.50', currency:'AUD', description:'Partial customer refund' });
-
-  results.push(t6, t7);
-
-  // ── Test 8 — reversal
-  const t8  = await run('8 – Reversal (needs HPP done)',       'POST', BASE+'/reversal', { merchantTransactionId:ts(), referenceUuid: debitUuid3 || debitUuid || 'PENDING' });
-  results.push(t8);
-
-  // ── Test 9 — incremental auth
-  const t9  = await run('9 – Incremental auth (needs HPP done)', 'POST', BASE+'/incrementalAuthorization', { merchantTransactionId:ts(), referenceUuid: preauthUuid4 || preauthUuid || 'PENDING', amount:'0.25', currency:'AUD' });
-  results.push(t9);
+  results.push(
+    hppPlaceholder('6 – Full refund (needs HPP done)'),
+    hppPlaceholder('7 – Partial refund (needs HPP done)')
+  );
+  results.push(hppPlaceholder('8 – Reversal (needs HPP done)'));
+  results.push(hppPlaceholder('9 – Incremental auth (needs HPP done)'));
 
   // ── Test 10 — negative tests (use SINGLE/no 3DS — user enters decline card on HPP)
   const t10a = await run('10.a – Negative debit',    'POST', BASE+'/debit',        { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'HOC Cert 10.a Negative', customer:CUST, ...URLS });
@@ -1453,11 +1437,11 @@ function renderAll(results){
 async function runAll(){
   const btn = document.getElementById('run-btn');
   btn.disabled=true; btn.textContent='Running…';
-  setStatus('Calling Till API for all 28 tests… ~6 minutes (throttled to avoid rate limit).');
+  setStatus('Calling Till API for all 28 tests… ~4 minutes (throttled to avoid rate limit).');
   startTimer();
   showProgress('Running 28 tests on Till sandbox…', 0);
   // Animate a time-based estimate bar (~220s expected)
-  const estMs = 360000; const t0 = Date.now();
+  const estMs = 260000; const t0 = Date.now();
   const pInt = setInterval(()=>{ const pct=Math.min(((Date.now()-t0)/estMs)*95,95); showProgress('Running 28 tests on Till sandbox…',pct); },400);
   try {
     const resp = await fetch('/api/cert/run-all');
