@@ -750,8 +750,8 @@ app.use('/api/payment-redirect-by-shopify-id', (req, res, next) => {
 app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
-    version: '1.4.4',
-    build: 'remove-pci-direct-na',
+    version: '1.4.5',
+    build: 'add-1.0-2.0-plain-tests',
     env: NODE_ENV,
     till_base: TILL_BASE_URL.includes('test-gateway') ? 'sandbox' : 'production'
   });
@@ -1630,14 +1630,16 @@ app.get('/api/cert/run-all', async (req, res) => {
   const d_1f = await runHPP('1.f – Debit SINGLE Dynamic Desc',   'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE',  description:'High on Chapel 13-Feb', customer:CUST, ...URLS });
   const d_1g = await runHPP('1.g – Debit SINGLE 3DS MANDATORY',  'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE',  description:'HOC Cert 1.g', customer:CUST, ...URLS, extraData:{'3dsecure':'MANDATORY'}, threeDSecureData:{'3dsecure':'MANDATORY',channel:'02',authenticationIndicator:'01',cardholderAuthenticationMethod:'01',challengeIndicator:'02'} }, '4000002000000008');
   const d_1h = await runHPP('1.h – Debit SINGLE 3DS OPTIONAL',   'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE',  description:'HOC Cert 1.h', customer:CUST, ...URLS, extraData:{'3dsecure':'OPTIONAL'}, threeDSecureData:{'3dsecure':'OPTIONAL',channel:'02',authenticationIndicator:'01',cardholderAuthenticationMethod:'01',challengeIndicator:'03'} });
-  const d_1_4k = await runHPP('1.0 – Debit (4000 3DS card)',     'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE',  description:'HOC Cert 1.0 4000', customer:CUST, ...URLS }, '4000002000000008');
+  const d_1_0  = await runHPP('1.0 – Debit (4111 card)',          'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE',  description:'HOC Cert 1.0 4111', customer:CUST, ...URLS });
+  const d_1_4k = await runHPP('1.0 – Debit (4000 card)',          'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE',  description:'HOC Cert 1.0 4000', customer:CUST, ...URLS }, '4000002000000008');
 
   const p_2a = await runHPP('2.a – Preauth INITIAL',              'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'INITIAL', description:'HOC Cert 2.a', customer:CUST, ...URLS, withRegister:true });
   const p_2e = await runHPP('2.e – Preauth SINGLE no 3DS',        'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE',  description:'HOC Cert 2.e', customer:CUST, ...URLS });
   const p_2f = await runHPP('2.f – Preauth SINGLE Dynamic Desc',  'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE',  description:'High on Chapel 13-Feb', customer:CUST, ...URLS });
   const p_2g = await runHPP('2.g – Preauth SINGLE 3DS MANDATORY', 'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE',  description:'HOC Cert 2.g', customer:CUST, ...URLS, extraData:{'3dsecure':'MANDATORY'}, threeDSecureData:{'3dsecure':'MANDATORY',channel:'02',authenticationIndicator:'01',cardholderAuthenticationMethod:'01',challengeIndicator:'02'} }, '4000002000000008');
   const p_2h = await runHPP('2.h – Preauth SINGLE 3DS OPTIONAL',  'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE',  description:'HOC Cert 2.h', customer:CUST, ...URLS, extraData:{'3dsecure':'OPTIONAL'}, threeDSecureData:{'3dsecure':'OPTIONAL',channel:'02',authenticationIndicator:'01',cardholderAuthenticationMethod:'01',challengeIndicator:'03'} });
-  const p_2_4k = await runHPP('2.0 – Preauth (4000 3DS card)',    'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE',  description:'HOC Cert 2.0 4000', customer:CUST, ...URLS }, '4000002000000008');
+  const p_2_0  = await runHPP('2.0 – Preauth (4111 card)',         'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE',  description:'HOC Cert 2.0 4111', customer:CUST, ...URLS });
+  const p_2_4k = await runHPP('2.0 – Preauth (4000 card)',         'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE',  description:'HOC Cert 2.0 4000', customer:CUST, ...URLS }, '4000002000000008');
 
   const t5   = await runHPP('5 – Register card (4111)', 'POST', BASE+'/register', { merchantTransactionId:ts(), customer:CUST, ...URLS });
   const t5_3ds = await runHPP('5.b – Register card (4000 3DS)', 'POST', BASE+'/register', { merchantTransactionId:ts(), customer:CUST, ...URLS }, '4000002000000008');
@@ -1682,14 +1684,14 @@ app.get('/api/cert/run-all', async (req, res) => {
 
   // ═══ Assemble results in display order (must match dashboard sections) ═══
   const results = [
-    d_1a, d_1b, d_1c, d_1d, d_1e, d_1f, d_1g, d_1h, d_1_4k,  // 0-8   Debits (incl 4000 card)
-    p_2a, p_2b, p_2c, p_2d, p_2e, p_2f, p_2g, p_2h, p_2_4k,  // 9-17  Preauths (incl 4000 card)
-    cap, capP, vd,                                              // 18-20 Capture/Void
-    t5, t5_3ds, d_reg1, d_reg2, dereg,                          // 21-25 Register/Deregister
-    reful, refPa,                                                // 26-27 Refunds
-    rev,                                                         // 28    Reversal
-    inc,                                                         // 29    Incremental
-    t10a, t10b, t10c                                             // 30-32 Negatives
+    d_1a, d_1b, d_1c, d_1d, d_1e, d_1f, d_1g, d_1h, d_1_0, d_1_4k, // 0-9   Debits (incl 1.0 both cards)
+    p_2a, p_2b, p_2c, p_2d, p_2e, p_2f, p_2g, p_2h, p_2_0, p_2_4k, // 10-19 Preauths (incl 2.0 both cards)
+    cap, capP, vd,                                              // 20-22 Capture/Void
+    t5, t5_3ds, d_reg1, d_reg2, dereg,                          // 23-27 Register/Deregister
+    reful, refPa,                                                // 28-29 Refunds
+    rev,                                                         // 30    Reversal
+    inc,                                                         // 31    Incremental
+    t10a, t10b, t10c                                             // 32-34 Negatives
   ];
 
   // Clean up shared Puppeteer browser
@@ -1884,14 +1886,14 @@ function renderSep(text){
 function renderAll(results){
   const body = document.getElementById('results-body');
   const sections = [
-    { label:'Tests 1.a–1.h · Debit', startIdx:0, count:9 },
-    { label:'Tests 2.a–2.h · Preauth', startIdx:9, count:9 },
-    { label:'Test 3 · Capture / Test 4 · Void', startIdx:18, count:3 },
-    { label:'Test 5 · Register / Debit from Register / Deregister', startIdx:21, count:5 },
-    { label:'Tests 6–7 · Refund', startIdx:26, count:2 },
-    { label:'Test 8 · Reversal', startIdx:28, count:1 },
-    { label:'Test 9 · Incremental Auth', startIdx:29, count:1 },
-    { label:'Test 10 · Negative (Declined)', startIdx:30, count:3 },
+    { label:'Tests 1.0–1.h · Debit', startIdx:0, count:10 },
+    { label:'Tests 2.0–2.h · Preauth', startIdx:10, count:10 },
+    { label:'Test 3 · Capture / Test 4 · Void', startIdx:20, count:3 },
+    { label:'Test 5 · Register / Debit from Register / Deregister', startIdx:23, count:5 },
+    { label:'Tests 6–7 · Refund', startIdx:28, count:2 },
+    { label:'Test 8 · Reversal', startIdx:30, count:1 },
+    { label:'Test 9 · Incremental Auth', startIdx:31, count:1 },
+    { label:'Test 10 · Negative (Declined)', startIdx:32, count:3 },
   ];
 
   let html='';
@@ -1910,9 +1912,9 @@ async function runAll(){
   btn.disabled=true; btn.textContent='Running…';
   setStatus('Fully automated: creating transactions, auto-completing HPP pages, running downstream tests… ~5 minutes.');
   startTimer();
-  showProgress('Running all 28 tests (HPP auto-completed)…', 0);
-  const estMs = 240000; const t0 = Date.now();
-  const pInt = setInterval(()=>{ const pct=Math.min(((Date.now()-t0)/estMs)*95,95); showProgress('Running all 28 tests (HPP auto-completed)…',pct); },400);
+  showProgress('Running all 35 tests (HPP auto-completed)…', 0);
+  const estMs = 260000; const t0 = Date.now();
+  const pInt = setInterval(()=>{ const pct=Math.min(((Date.now()-t0)/estMs)*95,95); showProgress('Running all 35 tests (HPP auto-completed)…',pct); },400);
   try {
     const resp = await fetch('/api/cert/run-all');
     clearInterval(pInt); showProgress('Processing results…',100);
@@ -2025,10 +2027,10 @@ async function rerunDependent(){
   // Patch lastResults at their positions and re-render
   const positions = {
     '1.b – Debit RECURRING': 1, '1.c – Debit CARDONFILE': 2, '1.d – Debit CARDONFILE-MERCHANT-INIT': 3,
-    '2.b – Preauth RECURRING': 10, '2.c – Preauth CARDONFILE': 11, '2.d – Preauth CARDONFILE-MERCHANT-INIT': 12,
-    '3 – Capture full': 18, '3.a – Capture partial': 19, '4 – Void preauth': 20,
-    '5.a – Deregister': 25,
-    '6 – Full refund': 26, '7 – Partial refund': 27, '8 – Reversal': 28, '9 – Incremental auth': 29
+    '2.b – Preauth RECURRING': 11, '2.c – Preauth CARDONFILE': 12, '2.d – Preauth CARDONFILE-MERCHANT-INIT': 13,
+    '3 – Capture full': 20, '3.a – Capture partial': 21, '4 – Void preauth': 22,
+    '5.a – Deregister': 27,
+    '6 – Full refund': 28, '7 – Partial refund': 29, '8 – Reversal': 30, '9 – Incremental auth': 31
   };
   for(const dr of depResults){
     for(const [key, idx] of Object.entries(positions)){
