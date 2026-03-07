@@ -215,7 +215,7 @@ async function closeHPPBrowser() {
   if (_hppBrowser) { await _hppBrowser.close().catch(() => {}); _hppBrowser = null; }
 }
 
-async function completeHPP(redirectUrl, cardNumber = '4111111111111111') {
+async function completeHPP(redirectUrl, cardNumber = '4111111111111111', expectDecline = false) {
   if (!redirectUrl) return { completed: false, error: 'No redirect URL' };
   if (!puppeteer)   return { completed: false, error: 'Puppeteer not available' };
 
@@ -230,7 +230,7 @@ async function completeHPP(redirectUrl, cardNumber = '4111111111111111') {
 
     // Already on terminal URL?
     if (/cert-paid|cert-error|cert-cancelled/.test(page.url()))
-      return { completed: /cert-paid/.test(page.url()), url: page.url() };
+      return { completed: /cert-paid/.test(page.url()) || (expectDecline && /cert-error/.test(page.url())), url: page.url() };
 
     // Give JS / Ixopay vault iframes time to initialise
     await _delay(4000);
@@ -285,8 +285,9 @@ async function completeHPP(redirectUrl, cardNumber = '4111111111111111') {
     // ── Already at terminal URL? ──
     if (/cert-paid|cert-error|cert-cancelled/.test(page.url())) {
       const finalUrl = page.url();
-      logger.info('[HPP] done', { url: finalUrl, completed: /cert-paid/.test(finalUrl) });
-      return { completed: /cert-paid/.test(finalUrl), url: finalUrl };
+      const completed = /cert-paid/.test(finalUrl) || (expectDecline && /cert-error/.test(finalUrl));
+      logger.info('[HPP] done', { url: finalUrl, completed, expectDecline });
+      return { completed, url: finalUrl };
     }
 
     // ── Detect inline error on HPP (e.g. declined card — no redirect) ──
@@ -297,8 +298,8 @@ async function completeHPP(redirectUrl, cardNumber = '4111111111111111') {
     }).catch(() => null);
 
     if (inlineError) {
-      logger.info('[HPP] inline error detected (decline card)', { preview: inlineError.substring(0, 100) });
-      return { completed: false, url: page.url(), error: 'HPP inline error (decline)' };
+      logger.info('[HPP] inline error detected (decline card)', { preview: inlineError.substring(0, 100), expectDecline });
+      return { completed: expectDecline, url: page.url(), error: expectDecline ? null : 'HPP inline error (decline)' };
     }
 
     // ── Handle 3DS challenge or intermediate pages ──
@@ -375,14 +376,14 @@ async function completeHPP(redirectUrl, cardNumber = '4111111111111111') {
         return /declined|do not hon|invalid card|transaction.{0,10}(failed|error)|not sufficient|card.{0,10}refused/i.test(text);
       }).catch(() => false);
       if (loopError) {
-        logger.info('[HPP] inline error detected in loop', { attempt: i });
-        return { completed: false, url: page.url(), error: 'HPP inline error (decline)' };
+        logger.info('[HPP] inline error detected in loop', { attempt: i, expectDecline });
+        return { completed: expectDecline, url: page.url(), error: expectDecline ? null : 'HPP inline error (decline)' };
       }
     }
 
     const finalUrl = page.url();
-    const completed = /cert-paid/.test(finalUrl);
-    logger.info('[HPP] done', { url: finalUrl, completed });
+    const completed = /cert-paid/.test(finalUrl) || (expectDecline && /cert-error/.test(finalUrl));
+    logger.info('[HPP] done', { url: finalUrl, completed, expectDecline });
     return { completed, url: finalUrl };
 
   } catch (err) {
@@ -749,8 +750,8 @@ app.use('/api/payment-redirect-by-shopify-id', (req, res, next) => {
 app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
-    version: '1.3.0',
-    build: 'fix-reversal-void',
+    version: '1.4.0',
+    build: 'fix-refund-negatives-ratelimit',
     env: NODE_ENV,
     till_base: TILL_BASE_URL.includes('test-gateway') ? 'sandbox' : 'production'
   });
@@ -1582,25 +1583,33 @@ app.get('/api/cert/run-all', async (_req, res) => {
 
   async function run(label, method, path, body = {}) {
     await sleep(18000);
-    try {
-      const r = await callTillAPI(method, path, body);
-      const d = r.body || {};
-      const success = d.success !== false && !(d.errors && d.errors.length);
-      if (!success) logger.warn('[CERT] test returned error', { label, status: r.status, errors: d.errors, returnType: d.returnType, code: d.code });
-      return { label, success, uuid: d.uuid || d.registrationId || null, redirectUrl: d.redirectUrl || null, raw: d };
-    } catch (e) {
-      return { label, success: false, uuid: null, redirectUrl: null, raw: { error: e.message } };
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const r = await callTillAPI(method, path, body);
+        const d = r.body || {};
+        if (d.errorCode === 1009 && attempt < 2) {
+          logger.warn('[CERT] rate limit, retrying', { label, attempt });
+          await sleep(15000);
+          continue;
+        }
+        const success = d.success !== false && !(d.errors && d.errors.length);
+        if (!success) logger.warn('[CERT] test returned error', { label, status: r.status, errors: d.errors, returnType: d.returnType, code: d.code });
+        return { label, success, uuid: d.uuid || d.registrationId || null, redirectUrl: d.redirectUrl || null, raw: d };
+      } catch (e) {
+        return { label, success: false, uuid: null, redirectUrl: null, raw: { error: e.message } };
+      }
     }
   }
 
   async function runHPP(label, method, path, body, cardNumber = '4111111111111111') {
+    const expectDecline = cardNumber === '4111111111111119';
     const r = await run(label, method, path, body);
     if (r.redirectUrl) {
-      const hpp = await completeHPP(r.redirectUrl, cardNumber);
+      const hpp = await completeHPP(r.redirectUrl, cardNumber, expectDecline);
       r.hppCompleted = hpp.completed;
       r.hppError     = hpp.error;
       if (!hpp.completed) r.needsManual = true;
-      logger.info('[CERT] HPP auto', { label, completed: hpp.completed, error: hpp.error });
+      logger.info('[CERT] HPP auto', { label, completed: hpp.completed, error: hpp.error, expectDecline });
     }
     return r;
   }
@@ -1646,7 +1655,7 @@ app.get('/api/cert/run-all', async (_req, res) => {
   const dereg= t5.uuid   && t5.hppCompleted   ? await run('5.a – Deregister',     'POST', BASE+'/deregister',               { merchantTransactionId:ts(), referenceUuid:t5.uuid })                                                               : FAIL('5.a – Deregister',     'Register (5) HPP not completed');
   const reful = d_1e.uuid && d_1e.hppCompleted ? await run('6 – Full refund',      'POST', BASE+'/refund',                   { merchantTransactionId:ts(), referenceUuid:d_1e.uuid, amount:'1.00', currency:'AUD', description:'Full refund' })    : FAIL('6 – Full refund',      'Debit 1.e HPP not completed');
   const refPa = d_1f.uuid && d_1f.hppCompleted ? await run('7 – Partial refund',   'POST', BASE+'/refund',                   { merchantTransactionId:ts(), referenceUuid:d_1f.uuid, amount:'0.50', currency:'AUD', description:'Partial refund' }) : FAIL('7 – Partial refund',   'Debit 1.f HPP not completed');
-  const rev  = d_1g.uuid && d_1g.hppCompleted ? await run('8 – Reversal',         'POST', BASE+'/void',                    { merchantTransactionId:ts(), referenceUuid:d_1g.uuid })                                                             : FAIL('8 – Reversal',         'Debit 1.g HPP not completed');
+  const rev  = d_1g.uuid && d_1g.hppCompleted ? await run('8 – Reversal',         'POST', BASE+'/refund',                   { merchantTransactionId:ts(), referenceUuid:d_1g.uuid, amount:'1.00', currency:'AUD', description:'Reversal (full refund)' }) : FAIL('8 – Reversal',         'Debit 1.g HPP not completed');
   const inc  = p_2h.uuid && p_2h.hppCompleted ? await run('9 – Incremental auth', 'POST', BASE+'/incrementalAuthorization', { merchantTransactionId:ts(), referenceUuid:p_2h.uuid, amount:'0.25', currency:'AUD' })                              : FAIL('9 – Incremental auth', 'Preauth 2.h HPP not completed');
 
   // ═══ Phase 5: Negative tests (decline card — HPP auto-completed) ═══
@@ -1972,7 +1981,7 @@ async function rerunDependent(){
   const refP = (debitUuid2||debitUuid)   ? await post('/api/till/refund/'+(debitUuid2||debitUuid),     {amount:'0.50',currency:'AUD',reason:'Partial refund'}) : {success:false,raw:{error:'No debit uuid (complete HPP on 1.f)'}};
   await sleep(10000);
   stepProgress('Reversal (8)');
-  const rev  = (debitUuid3||debitUuid)   ? await post('/api/till/void/'+(debitUuid3||debitUuid),   {}) : {success:false,raw:{error:'No debit uuid (complete HPP on 1.g)'}};
+  const rev  = (debitUuid3||debitUuid)   ? await post('/api/till/refund/'+(debitUuid3||debitUuid),   {amount:'1.00',currency:'AUD',reason:'Reversal (full refund)',merchantTransactionId:t()}) : {success:false,raw:{error:'No debit uuid (complete HPP on 1.g)'}};
   await sleep(10000);
   stepProgress('Incremental auth (9)');
   const inc  = (preauthUuid4||preauthUuid) ? await post('/api/till/incremental/'+(preauthUuid4||preauthUuid), {amount:'0.25',currency:'AUD'}) : {success:false,raw:{error:'No preauth uuid (complete HPP on 2.h)'}};  
@@ -2241,20 +2250,24 @@ app.post('/api/till/refund/:referenceUuid', async (req, res) => {
 });
 
 // ── POST /api/till/reversal/:referenceUuid ───────────────────────────────────
-// Test 8 — debit reversal via void (Till has no /reversal endpoint)
+// Test 8 — debit reversal via refund (void only works on preauthorize)
 
 app.post('/api/till/reversal/:referenceUuid', async (req, res) => {
   try {
     const { referenceUuid } = req.params;
+    const { amount = '1.00', currency = 'AUD', reason = 'Reversal (full refund)' } = req.body || {};
     const payload = {
       merchantTransactionId: `HOC-REV-${Date.now()}`,
-      referenceUuid
+      referenceUuid,
+      amount,
+      currency,
+      description: reason
     };
-    const result = await callTillAPI('POST', `/api/v3/transaction/${TILL_API_KEY}/void`, payload);
-    logger.info('[CERT] Reversal (void)', { referenceUuid, status: result.status });
+    const result = await callTillAPI('POST', `/api/v3/transaction/${TILL_API_KEY}/refund`, payload);
+    logger.info('[CERT] Reversal (refund)', { referenceUuid, amount, status: result.status });
     res.json({ success: result.body?.success ?? false, ...result.body, _httpStatus: result.status });
   } catch (err) {
-    logger.error('[CERT] Reversal (void) error', { error: err.message });
+    logger.error('[CERT] Reversal (refund) error', { error: err.message });
     res.status(500).json({ error: err.message });
   }
 });
