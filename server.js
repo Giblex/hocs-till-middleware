@@ -1709,13 +1709,20 @@ async function runAll(){
     const hppAuto = data.hppAuto || 0;
     const hppFailed = data.hppFailed || 0;
     let msg = \`Done. \${ok}/\${lastResults.length} tests passed. HPP auto-completed: \${hppAuto}.\`;
-    if (hppFailed > 0) msg += \` ⚠️ \${hppFailed} HPP failed — open those payment links manually, then click Re-run.\`;
+    if (hppFailed > 0) msg += \` ⚠️ \${hppFailed} HPP failed — auto-retrying dependent tests…\`;
     setStatus(msg);
+    hideProgress();
+    btn.disabled=false; btn.textContent='▶ Run All Certification Tests';
+    // Auto-trigger re-run if any HPP failed so downstream tests retry
+    if (hppFailed > 0) {
+      await sleep(2000);
+      await rerunDependent();
+    }
   } catch(e){
     setStatus('Error: '+e.message);
+    hideProgress();
+    btn.disabled=false; btn.textContent='▶ Run All Certification Tests';
   }
-  hideProgress();
-  btn.disabled=false; btn.textContent='▶ Run All Certification Tests';
 }
 
 async function rerunDependent(){
@@ -1806,8 +1813,12 @@ async function rerunDependent(){
   renderAll(lastResults);
   hideProgress();
   btn.disabled = false;
-  setStatus('Re-run complete. Check updated rows above.');
+  const reOk = depResults.filter(r=>r.success).length;
+  setStatus(\`Re-run complete. \${reOk}/\${depResults.length} downstream tests passed.\`);
 }
+
+// Auto-start all tests when page loads — fully hands-off
+window.addEventListener('DOMContentLoaded', () => { runAll(); });
 </script>
 </body>
 </html>`);
