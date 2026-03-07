@@ -744,7 +744,8 @@ app.use('/api/payment-redirect-by-shopify-id', (req, res, next) => {
 app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
-    version: '1.1.0',
+    version: '1.2.0',
+    build: 'ba04de2-fix',
     env: NODE_ENV,
     till_base: TILL_BASE_URL.includes('test-gateway') ? 'sandbox' : 'production'
   });
