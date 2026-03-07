@@ -750,8 +750,8 @@ app.use('/api/payment-redirect-by-shopify-id', (req, res, next) => {
 app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
-    version: '1.4.0',
-    build: 'fix-refund-negatives-ratelimit',
+    version: '1.4.1',
+    build: 'fix-keepalive-stream',
     env: NODE_ENV,
     till_base: TILL_BASE_URL.includes('test-gateway') ? 'sandbox' : 'production'
   });
@@ -1577,7 +1577,12 @@ app.get('/api/cert/hpp-debug', async (_req, res) => {
 // HPP-based tests return a redirectUrl the user must open once; all UUIDs and
 // remarks are pre-generated here.
 
-app.get('/api/cert/run-all', async (_req, res) => {
+app.get('/api/cert/run-all', async (req, res) => {
+  // Stream keepalive chunks to prevent Railway proxy / browser timeout (~5 min idle limit)
+  res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' });
+  const _keepalive = setInterval(() => { if (!res.writableEnded) res.write(' '); }, 10000);
+  req.on('close', () => clearInterval(_keepalive));
+  try {
   const ts = () => `HOC-CERT-${Date.now()}-${Math.floor(Math.random()*9999)}`;
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -1685,7 +1690,13 @@ app.get('/api/cert/run-all', async (_req, res) => {
   const hppAuto   = results.filter(r => r.hppCompleted).length;
   const hppFailed = results.filter(r => r.needsManual && !/Negative/i.test(r.label)).length;
   logger.info('[CERT] run-all done', { total: results.length, hppAuto, hppFailed });
-  res.json({ ok: true, results, hppAuto, hppFailed });
+  clearInterval(_keepalive);
+  res.end(JSON.stringify({ ok: true, results, hppAuto, hppFailed }));
+  } catch(fatalErr) {
+    clearInterval(_keepalive);
+    logger.error('[CERT] run-all fatal', { error: fatalErr.message });
+    if (!res.writableEnded) res.end(JSON.stringify({ ok: false, error: fatalErr.message }));
+  }
 });
 
 // ENDPOINT: GET /
@@ -1897,7 +1908,7 @@ async function runAll(){
   try {
     const resp = await fetch('/api/cert/run-all');
     clearInterval(pInt); showProgress('Processing results…',100);
-    const data = await resp.json();
+    const data = JSON.parse(await resp.text());
     lastResults = data.results;
     // Extract key UUIDs for manual re-run fallback
     debitUuid          = lastResults.find(r=>r.label.includes('1.e'))?.uuid || null;
