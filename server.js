@@ -34,6 +34,11 @@ const rateLimit  = require('express-rate-limit');
 const Database   = require('better-sqlite3');
 const nodemailer = require('nodemailer');
 
+// Optional: Puppeteer for HPP auto-completion (cert testing)
+let puppeteer;
+try { puppeteer = require('puppeteer-core'); }
+catch { puppeteer = null; console.warn('[BOOT] puppeteer-core not installed – HPP auto-completion disabled'); }
+
 // ─── Configuration ──────────────────────────────────────────────────────────
 
 const {
@@ -186,118 +191,178 @@ async function callTillAPI(method, relativeUri, body = null) {
   return { status: res.status, body: json, rawBody: text };
 }
 
-// ─── HPP Auto-Completion (for automated certification testing) ──────────────
-// Fetches the Till Hosted Payment Page, parses the HTML form, fills in test
-// card data, and submits — eliminating manual card entry for each test.
+// ─── HPP Auto-Completion (Puppeteer headless Chrome) ────────────────────────
+// Launches a real browser to navigate Till's hosted payment page, fill in test
+// card data, and submit — works even when the HPP is a JS-rendered SPA.
+
+const _delay = ms => new Promise(r => setTimeout(r, ms));
+let _hppBrowser = null;
+
+async function getHPPBrowser() {
+  if (!puppeteer) throw new Error('puppeteer-core not available');
+  if (_hppBrowser && _hppBrowser.isConnected()) return _hppBrowser;
+  _hppBrowser = await puppeteer.launch({
+    executablePath: process.env.CHROMIUM_PATH || '/usr/bin/chromium',
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+           '--disable-gpu', '--single-process', '--no-zygote'],
+    headless: 'new',
+    timeout: 20000
+  });
+  return _hppBrowser;
+}
+
+async function closeHPPBrowser() {
+  if (_hppBrowser) { await _hppBrowser.close().catch(() => {}); _hppBrowser = null; }
+}
 
 async function completeHPP(redirectUrl, cardNumber = '4111111111111111') {
   if (!redirectUrl) return { completed: false, error: 'No redirect URL' };
+  if (!puppeteer)   return { completed: false, error: 'Puppeteer not available' };
+
+  let page;
   try {
-    const resp = await fetch(redirectUrl, {
-      redirect: 'follow',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+    const browser = await getHPPBrowser();
+    page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+
+    logger.info('[HPP] navigating', { url: redirectUrl });
+    await page.goto(redirectUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+
+    // Already on terminal URL?
+    if (/cert-paid|cert-error|cert-cancelled/.test(page.url()))
+      return { completed: /cert-paid/.test(page.url()), url: page.url() };
+
+    // Give JS time to render the payment form
+    await _delay(3000);
+
+    // ── Find the frame (main or iframe) that contains card inputs ──
+    const allFrames = [page.mainFrame(), ...page.frames().filter(f => f !== page.mainFrame())];
+    let cardFrame = null;
+    for (const frame of allFrames) {
+      const hasCard = await frame.evaluate(() => {
+        const inputs = document.querySelectorAll('input');
+        return [...inputs].some(i => {
+          const a = [i.name, i.id, i.className, i.autocomplete || '', i.placeholder || ''].join(' ').toLowerCase();
+          return /card|number|pan|cc-number/.test(a) && !/phone|zip|postal/.test(a);
+        });
+      }).catch(() => false);
+      if (hasCard) { cardFrame = frame; break; }
+    }
+
+    if (!cardFrame) {
+      const html = await page.content();
+      logger.warn('[HPP] no card input found', { url: page.url(), htmlLen: html.length, snippet: html.substring(0, 3000) });
+      return { completed: false, error: 'No card input found', url: page.url() };
+    }
+
+    // ── Fill every field in one evaluate call ──
+    await cardFrame.evaluate((cn) => {
+      function setVal(el, v) {
+        el.focus();
+        el.value = v;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.dispatchEvent(new Event('blur', { bubbles: true }));
       }
+      const els = document.querySelectorAll('input, select');
+      for (const el of els) {
+        const a = [el.name, el.id, el.className, el.autocomplete || '', el.placeholder || ''].join(' ').toLowerCase();
+        const isInput  = el.tagName === 'INPUT';
+        const isSelect = el.tagName === 'SELECT';
+
+        // Card number
+        if (isInput && /card.?number|pan|cc-number|creditcard/.test(a) && !/phone/.test(a)) {
+          setVal(el, cn);
+        }
+        // Expiry month
+        else if (/exp.*month|month.*exp|cc-exp-month/.test(a)) {
+          if (isSelect) {
+            const opt = [...el.options].find(o => o.value === '12' || o.text.includes('12'));
+            if (opt) { el.value = opt.value; el.dispatchEvent(new Event('change', { bubbles: true })); }
+          } else setVal(el, '12');
+        }
+        // Expiry year
+        else if (/exp.*year|year.*exp|cc-exp-year/.test(a)) {
+          if (isSelect) {
+            const opt = [...el.options].find(o => /2030|30/.test(o.value));
+            if (opt) { el.value = opt.value; el.dispatchEvent(new Event('change', { bubbles: true })); }
+          } else setVal(el, '2030');
+        }
+        // Combined expiry (MM/YY or MMYY)
+        else if (isInput && /expir|cc-exp/.test(a) && !/month|year/.test(a)) {
+          setVal(el, '12/30');
+        }
+        // CVV / CVC
+        else if (isInput && /cvv|cvc|secur|verif|cc-csc/.test(a)) {
+          setVal(el, '123');
+        }
+        // Cardholder name
+        else if (isInput && /holder|card.*name|name.*card|cc-name/.test(a)) {
+          setVal(el, 'Test Customer');
+        }
+      }
+    }, cardNumber);
+
+    logger.info('[HPP] form filled, submitting');
+
+    // ── Click submit / pay button ──
+    const clicked = await cardFrame.evaluate(() => {
+      const btns = [...document.querySelectorAll('button, input[type="submit"], a.btn, a.button')];
+      const payBtn = btns.find(b => {
+        const t = (b.textContent || b.value || '').toLowerCase();
+        const s = window.getComputedStyle(b);
+        return /pay|submit|confirm|continue|proceed/.test(t) && s.display !== 'none' && s.visibility !== 'hidden';
+      }) || btns.find(b => b.type === 'submit' && window.getComputedStyle(b).display !== 'none');
+      if (payBtn) { payBtn.click(); return true; }
+      const form = document.querySelector('form');
+      if (form) { form.submit(); return true; }
+      return false;
     });
-    const html = await resp.text();
-    const pageUrl = resp.url;
-    const jar = (resp.headers.raw?.()?.['set-cookie'] || []).map(c => c.split(';')[0]).join('; ');
 
-    logger.info('[HPP-AUTO] Fetched', { from: redirectUrl, landed: pageUrl, size: html.length });
-    return await _submitHPPForm(html, pageUrl, jar, cardNumber, 0);
+    if (!clicked) {
+      return { completed: false, error: 'No submit button found', url: page.url() };
+    }
+
+    // ── Wait for navigation / redirect ──
+    await page.waitForNavigation({ timeout: 30000, waitUntil: 'networkidle2' }).catch(() => {});
+
+    // ── Handle 3DS challenge or intermediate pages ──
+    for (let i = 0; i < 4 && !/cert-paid|cert-error|cert-cancelled/.test(page.url()); i++) {
+      logger.info('[HPP] intermediate page', { url: page.url(), attempt: i });
+      await _delay(3000);
+
+      // Try clicking any visible submit / continue button
+      const clickedChallenge = await page.evaluate(() => {
+        const btns = [...document.querySelectorAll('button, input[type="submit"]')];
+        const btn = btns.find(b => { const s = window.getComputedStyle(b); return s.display !== 'none' && s.visibility !== 'hidden' && b.offsetWidth > 0; });
+        if (btn) { btn.click(); return true; }
+        const form = document.querySelector('form');
+        if (form) { form.submit(); return true; }
+        return false;
+      }).catch(() => false);
+
+      if (clickedChallenge) {
+        await page.waitForNavigation({ timeout: 20000, waitUntil: 'networkidle2' }).catch(() => {});
+      } else {
+        // Wait for auto-redirect (some 3DS pages auto-submit)
+        await page.waitForFunction(
+          'location.href.includes("cert-paid") || location.href.includes("cert-error") || location.href.includes("cert-cancelled")',
+          { timeout: 15000 }
+        ).catch(() => {});
+      }
+    }
+
+    const finalUrl = page.url();
+    const completed = /cert-paid/.test(finalUrl);
+    logger.info('[HPP] done', { url: finalUrl, completed });
+    return { completed, url: finalUrl };
+
   } catch (err) {
-    logger.error('[HPP-AUTO] Fetch failed', { url: redirectUrl, err: err.message });
+    logger.error('[HPP] error', { url: redirectUrl, err: err.message });
     return { completed: false, error: err.message };
+  } finally {
+    if (page) await page.close().catch(() => {});
   }
-}
-
-async function _submitHPPForm(html, pageUrl, cookies, cardNumber, depth) {
-  if (depth > 3) return { completed: false, error: 'Too many form hops' };
-
-  // Already on our success / error / cancel page?
-  if (/cert-paid|cert-error|cert-cancelled/.test(pageUrl)) {
-    return { completed: true, url: pageUrl };
-  }
-
-  // ── find the best <form> ──
-  const formRe = /<form([^>]*)>([\s\S]*?)<\/form>/gi;
-  let best = null, m;
-  while ((m = formRe.exec(html)) !== null) {
-    const attrs = m[1], body = m[2];
-    best = { attrs, body };
-    if (/card|number|pan|cvv|cvc|expir/i.test(body)) break;   // prefer card form
-  }
-  if (!best) {
-    logger.warn('[HPP-AUTO] No <form> found', { url: pageUrl, snippet: html.substring(0, 2000) });
-    return { completed: false, error: 'No form found', html: html.substring(0, 800) };
-  }
-
-  const actM = best.attrs.match(/action=["']([^"']*)/i);
-  const metM = best.attrs.match(/method=["']([^"']*)/i);
-  const action = actM ? actM[1].replace(/&amp;/g, '&') : pageUrl;
-  const method = metM ? metM[1].toUpperCase() : 'POST';
-  const submitUrl = /^https?:\/\//i.test(action) ? action : new URL(action, pageUrl).href;
-
-  // ── parse input + select fields ──
-  const fields = {};
-  const inpRe = /<input\s+([^>]*?)\/?>/gi;
-  while ((m = inpRe.exec(best.body)) !== null) {
-    const a = m[1];
-    const nm  = (a.match(/name=["']([^"']*)/i)  || [])[1];
-    const val = (a.match(/value=["']([^"']*)/i) || [])[1] || '';
-    const tp  = ((a.match(/type=["']([^"']*)/i) || [])[1] || 'text').toLowerCase();
-    if (nm && tp !== 'submit' && tp !== 'button' && tp !== 'image') fields[nm] = val;
-  }
-  const selRe = /<select[^>]*name=["']([^"']*)[^>]*>([\s\S]*?)<\/select>/gi;
-  while ((m = selRe.exec(best.body)) !== null) {
-    const nm  = m[1];
-    const sel = (m[2].match(/<option[^>]*selected[^>]*value=["']([^"']*)/i) || [])[1];
-    const fst = (m[2].match(/<option[^>]*value=["']([^"']*)/i) || [])[1];
-    if (!fields[nm]) fields[nm] = sel || fst || '';
-  }
-
-  // ── fill card data ──
-  for (const key of Object.keys(fields)) {
-    const k = key.toLowerCase();
-    if (k.includes('number') || k.includes('pan') || k === 'card' || k.includes('creditcard') || k.includes('account'))
-      fields[key] = cardNumber;
-    else if ((k.includes('exp') || k.includes('card')) && k.includes('month'))
-      fields[key] = '12';
-    else if ((k.includes('exp') || k.includes('card')) && k.includes('year'))
-      fields[key] = '2030';
-    else if (k.includes('cvv') || k.includes('cvc') || k.includes('secur') || k.includes('verif'))
-      fields[key] = '123';
-    else if (k.includes('holder') || k.includes('name_on') || (k.includes('card') && k.includes('name')))
-      fields[key] = 'Test Customer';
-  }
-
-  logger.info('[HPP-AUTO] Submitting', { url: submitUrl, fields: Object.keys(fields) });
-
-  const resp = await fetch(submitUrl, {
-    method,
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120',
-      'Referer': pageUrl,
-      ...(cookies ? { Cookie: cookies } : {})
-    },
-    body: new URLSearchParams(fields).toString(),
-    redirect: 'follow'
-  });
-
-  const nextHtml = await resp.text();
-  const nextUrl  = resp.url;
-  const nextJar  = (resp.headers.raw?.()?.['set-cookie'] || []).map(c => c.split(';')[0]).join('; ') || cookies;
-
-  logger.info('[HPP-AUTO] Result', { url: nextUrl, status: resp.status });
-
-  // terminal?
-  if (/cert-paid|cert-error|cert-cancelled/.test(nextUrl)) {
-    return { completed: true, url: nextUrl };
-  }
-  // another form (3DS challenge etc.) → recurse
-  return _submitHPPForm(nextHtml, nextUrl, nextJar, cardNumber, depth + 1);
 }
 
 // ─── Shopify Admin API Client (2026 Client Credentials Grant) ───────────────
@@ -1260,7 +1325,8 @@ app.get('/cert-error', (_req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 // ENDPOINT: GET /api/cert/hpp-debug
 // ═════════════════════════════════════════════════════════════════════════════
-// Diagnostic: create a throwaway debit, fetch the HPP page, return raw HTML analysis.
+// Diagnostic: create a throwaway debit, load the HPP in headless Chrome,
+// return rendered HTML analysis (sees JS-rendered forms unlike plain fetch).
 app.get('/api/cert/hpp-debug', async (_req, res) => {
   try {
     const ts = `HPP-DEBUG-${Date.now()}`;
@@ -1274,38 +1340,40 @@ app.get('/api/cert/hpp-debug', async (_req, res) => {
     const d = r.body || {};
     if (!d.redirectUrl) return res.json({ error: 'No redirectUrl', raw: d });
 
-    const resp = await fetch(d.redirectUrl, {
-      redirect: 'follow',
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120', 'Accept': 'text/html,*/*' }
-    });
-    const html = await resp.text();
-    const landedUrl = resp.url;
+    // Use Puppeteer to see the RENDERED page (not raw HTML)
+    if (!puppeteer) return res.json({ error: 'Puppeteer not available', redirectUrl: d.redirectUrl });
+    const browser = await getHPPBrowser();
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120');
+    await page.goto(d.redirectUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+    await _delay(3000); // Let JS render
 
-    // Analyse
-    const forms = [];
-    const formRe = /<form([^>]*)>([\s\S]*?)<\/form>/gi;
-    let m;
-    while ((m = formRe.exec(html)) !== null) {
-      const inputs = [];
-      const inpRe2 = /<input\s+([^>]*?)\/?>/gi;
-      let im;
-      while ((im = inpRe2.exec(m[2])) !== null) {
-        const nm = (im[1].match(/name=["']([^"']*)/i) || [])[1] || '(no name)';
-        const tp = (im[1].match(/type=["']([^"']*)/i) || [])[1] || 'text';
-        inputs.push({ name: nm, type: tp });
-      }
-      forms.push({ attrs: m[1].substring(0, 200), inputCount: inputs.length, inputs });
-    }
+    const debug = await page.evaluate(() => {
+      const inputs = [...document.querySelectorAll('input, select, textarea')].map(el => ({
+        tag: el.tagName, name: el.name, id: el.id, type: el.type,
+        autocomplete: el.autocomplete || '', placeholder: el.placeholder || '',
+        className: el.className, visible: el.offsetWidth > 0 && el.offsetHeight > 0
+      }));
+      const forms = [...document.querySelectorAll('form')].map(f => ({
+        action: f.action, method: f.method, id: f.id, className: f.className,
+        inputCount: f.querySelectorAll('input, select').length
+      }));
+      const iframes = [...document.querySelectorAll('iframe')].map(f => ({
+        src: f.src, id: f.id, name: f.name, width: f.offsetWidth, height: f.offsetHeight
+      }));
+      return { title: document.title, inputs, forms, iframes, bodyText: document.body?.innerText?.substring(0, 2000) || '' };
+    });
+
+    const html = await page.content();
+    await page.close().catch(() => {});
 
     res.json({
       redirectUrl: d.redirectUrl,
-      landedUrl,
-      status: resp.status,
+      landedUrl: page.url ? page.url() : 'closed',
       htmlLength: html.length,
+      rendered: debug,
       htmlFirst3000: html.substring(0, 3000),
-      htmlLast1000: html.substring(html.length - 1000),
-      formsFound: forms.length,
-      forms
+      htmlLast1000: html.substring(html.length - 1000)
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1405,6 +1473,9 @@ app.get('/api/cert/run-all', async (_req, res) => {
     inc,                                                 // 24    Incremental
     t10a, t10b, t10c                                     // 25-27 Negatives
   ];
+
+  // Clean up shared Puppeteer browser
+  await closeHPPBrowser();
 
   const hppAuto   = results.filter(r => r.hppCompleted).length;
   const hppFailed = results.filter(r => r.needsManual).length;
