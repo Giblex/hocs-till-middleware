@@ -303,7 +303,7 @@ async function completeHPP(redirectUrl, cardNumber = '4111111111111111') {
 
     // ── Handle 3DS challenge or intermediate pages ──
     for (let i = 0; i < 6 && !/cert-paid|cert-error|cert-cancelled/.test(page.url()); i++) {
-      const frameUrls = page.frames().map(f => f.url());
+      const frameUrls = page.frames().map(f => { try { return f.url(); } catch { return '(detached)'; } });
       logger.info('[HPP] intermediate page', { url: page.url(), attempt: i, frames: frameUrls });
       await _delay(3000);
 
@@ -312,6 +312,7 @@ async function completeHPP(redirectUrl, cardNumber = '4111111111111111') {
       let clickedChallenge = false;
       const mainUrl = page.url();
       for (const frame of page.frames()) {
+        try {
         const fUrl = frame.url();
         // Skip main frame if still on the payment page (has its own Submit btn)
         if (frame === page.mainFrame() && /tillpayments\.com\/payment\//i.test(fUrl)) continue;
@@ -334,6 +335,10 @@ async function completeHPP(redirectUrl, cardNumber = '4111111111111111') {
         if (clickedChallenge) {
           logger.info('[HPP] clicked 3DS challenge button', { frameUrl: fUrl });
           break;
+        }
+        } catch (frameErr) {
+          logger.warn('[HPP] frame detached during iteration', { err: frameErr.message });
+          continue;
         }
       }
 
@@ -744,8 +749,8 @@ app.use('/api/payment-redirect-by-shopify-id', (req, res, next) => {
 app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
-    version: '1.2.0',
-    build: 'ba04de2-fix',
+    version: '1.3.0',
+    build: 'fix-reversal-void',
     env: NODE_ENV,
     till_base: TILL_BASE_URL.includes('test-gateway') ? 'sandbox' : 'production'
   });
@@ -1641,14 +1646,16 @@ app.get('/api/cert/run-all', async (_req, res) => {
   const dereg= t5.uuid   && t5.hppCompleted   ? await run('5.a – Deregister',     'POST', BASE+'/deregister',               { merchantTransactionId:ts(), referenceUuid:t5.uuid })                                                               : FAIL('5.a – Deregister',     'Register (5) HPP not completed');
   const reful = d_1e.uuid && d_1e.hppCompleted ? await run('6 – Full refund',      'POST', BASE+'/refund',                   { merchantTransactionId:ts(), referenceUuid:d_1e.uuid, amount:'1.00', currency:'AUD', description:'Full refund' })    : FAIL('6 – Full refund',      'Debit 1.e HPP not completed');
   const refPa = d_1f.uuid && d_1f.hppCompleted ? await run('7 – Partial refund',   'POST', BASE+'/refund',                   { merchantTransactionId:ts(), referenceUuid:d_1f.uuid, amount:'0.50', currency:'AUD', description:'Partial refund' }) : FAIL('7 – Partial refund',   'Debit 1.f HPP not completed');
-  const rev  = d_1g.uuid && d_1g.hppCompleted ? await run('8 – Reversal',         'POST', BASE+'/reversal',                 { merchantTransactionId:ts(), referenceUuid:d_1g.uuid })                                                             : FAIL('8 – Reversal',         'Debit 1.g HPP not completed');
+  const rev  = d_1g.uuid && d_1g.hppCompleted ? await run('8 – Reversal',         'POST', BASE+'/void',                    { merchantTransactionId:ts(), referenceUuid:d_1g.uuid })                                                             : FAIL('8 – Reversal',         'Debit 1.g HPP not completed');
   const inc  = p_2h.uuid && p_2h.hppCompleted ? await run('9 – Incremental auth', 'POST', BASE+'/incrementalAuthorization', { merchantTransactionId:ts(), referenceUuid:p_2h.uuid, amount:'0.25', currency:'AUD' })                              : FAIL('9 – Incremental auth', 'Preauth 2.h HPP not completed');
 
   // ═══ Phase 5: Negative tests (decline card — HPP auto-completed) ═══
-  // Close & re-open browser to avoid detached-frame errors from prior HPP pages
+  // Close & re-open browser between EACH negative test to avoid detached-frame errors
   await closeHPPBrowser();
   const t10a = await runHPP('10.a – Negative debit',    'POST', BASE+'/debit',        { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'HOC Cert 10.a Negative', customer:CUST, ...URLS }, '4111111111111119');
+  await closeHPPBrowser();
   const t10b = await runHPP('10.b – Negative preauth',  'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'HOC Cert 10.b Negative', customer:CUST, ...URLS }, '4111111111111119');
+  await closeHPPBrowser();
   const t10c = await runHPP('10.c – Negative register', 'POST', BASE+'/register',     { merchantTransactionId:ts(), customer:CUST, ...URLS }, '4111111111111119');
 
   // ═══ Assemble results in display order (must match dashboard sections) ═══
@@ -1965,7 +1972,7 @@ async function rerunDependent(){
   const refP = (debitUuid2||debitUuid)   ? await post('/api/till/refund/'+(debitUuid2||debitUuid),     {amount:'0.50',currency:'AUD',reason:'Partial refund'}) : {success:false,raw:{error:'No debit uuid (complete HPP on 1.f)'}};
   await sleep(10000);
   stepProgress('Reversal (8)');
-  const rev  = (debitUuid3||debitUuid)   ? await post('/api/till/reversal/'+(debitUuid3||debitUuid),   {}) : {success:false,raw:{error:'No debit uuid (complete HPP on 1.g)'}};
+  const rev  = (debitUuid3||debitUuid)   ? await post('/api/till/void/'+(debitUuid3||debitUuid),   {}) : {success:false,raw:{error:'No debit uuid (complete HPP on 1.g)'}};
   await sleep(10000);
   stepProgress('Incremental auth (9)');
   const inc  = (preauthUuid4||preauthUuid) ? await post('/api/till/incremental/'+(preauthUuid4||preauthUuid), {amount:'0.25',currency:'AUD'}) : {success:false,raw:{error:'No preauth uuid (complete HPP on 2.h)'}};  
@@ -2234,7 +2241,7 @@ app.post('/api/till/refund/:referenceUuid', async (req, res) => {
 });
 
 // ── POST /api/till/reversal/:referenceUuid ───────────────────────────────────
-// Test 8 — debit reversal (must be called quickly after the original debit)
+// Test 8 — debit reversal via void (Till has no /reversal endpoint)
 
 app.post('/api/till/reversal/:referenceUuid', async (req, res) => {
   try {
@@ -2243,11 +2250,11 @@ app.post('/api/till/reversal/:referenceUuid', async (req, res) => {
       merchantTransactionId: `HOC-REV-${Date.now()}`,
       referenceUuid
     };
-    const result = await callTillAPI('POST', `/api/v3/transaction/${TILL_API_KEY}/reversal`, payload);
-    logger.info('[CERT] Reversal', { referenceUuid, status: result.status });
+    const result = await callTillAPI('POST', `/api/v3/transaction/${TILL_API_KEY}/void`, payload);
+    logger.info('[CERT] Reversal (void)', { referenceUuid, status: result.status });
     res.json({ success: result.body?.success ?? false, ...result.body, _httpStatus: result.status });
   } catch (err) {
-    logger.error('[CERT] Reversal error', { error: err.message });
+    logger.error('[CERT] Reversal (void) error', { error: err.message });
     res.status(500).json({ error: err.message });
   }
 });
