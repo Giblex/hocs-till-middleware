@@ -1391,6 +1391,120 @@ app.get('/api/cert/hpp-test', async (_req, res) => {
   }
 });
 
+// ENDPOINT: GET /api/cert/hpp-3ds-debug
+// ═════════════════════════════════════════════════════════════════════════════
+// Creates a 3DS-MANDATORY transaction, fills form with 3DS test card, submits,
+// then captures the full state of all frames on the resulting page.
+app.get('/api/cert/hpp-3ds-debug', async (_req, res) => {
+  try {
+    const ts = `HPP-3DS-DBG-${Date.now()}`;
+    const BASE = `/api/v3/transaction/${TILL_API_KEY}`;
+    const r = await callTillAPI('POST', BASE + '/debit', {
+      merchantTransactionId: ts, amount: '1.00', currency: 'AUD',
+      transactionIndicator: 'SINGLE', description: '3DS Debug',
+      customer: { firstName: 'Test', lastName: '3DS', email: '3ds@test.com', ipAddress: '127.0.0.1', billingCountry: 'AU' },
+      successUrl: CERT_SUCCESS_URL, cancelUrl: CERT_CANCEL_URL, errorUrl: CERT_ERROR_URL, callbackUrl: CALLBACK_URL,
+      extraData: { '3dsecure': 'MANDATORY' },
+      threeDSecureData: { '3dsecure': 'MANDATORY', channel: '02', authenticationIndicator: '01', cardholderAuthenticationMethod: '01', challengeIndicator: '02' }
+    });
+    const d = r.body || {};
+    if (!d.redirectUrl) return res.json({ error: 'No redirectUrl', raw: d });
+
+    if (!puppeteer) return res.json({ error: 'Puppeteer not available' });
+    const browser = await getHPPBrowser();
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120');
+    
+    // Step 1: Navigate to HPP
+    await page.goto(d.redirectUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+    await _delay(4000);
+
+    // Step 2: Fill form fields
+    const firstName = await page.$('#first_name');
+    const lastName  = await page.$('#last_name');
+    if (firstName) { await firstName.click({ clickCount: 3 }); await firstName.type('Test'); }
+    if (lastName)  { await lastName.click({ clickCount: 3 }); await lastName.type('ThreeDS'); }
+    await page.select('#month', '12').catch(() => {});
+    await page.select('#year', '2030').catch(() => {});
+
+    // PAN iframe
+    const panFrame = page.frames().find(f => /\/iframes\/pan/i.test(f.url()));
+    if (panFrame) {
+      const inp = await panFrame.waitForSelector('input', { timeout: 5000 }).catch(() => null);
+      if (inp) { await inp.click(); await inp.type('4000002000000008'); }
+    }
+    // CVV iframe
+    const cvvFrame = page.frames().find(f => /\/iframes\/cvv/i.test(f.url()));
+    if (cvvFrame) {
+      const inp = await cvvFrame.waitForSelector('input', { timeout: 5000 }).catch(() => null);
+      if (inp) { await inp.click(); await inp.type('123'); }
+    }
+
+    // Step 3: Click Submit
+    await page.evaluate(() => {
+      const btns = [...document.querySelectorAll('button, input[type="submit"]')];
+      const pay = btns.find(b => /submit|pay/i.test((b.textContent || b.value || '').trim()));
+      if (pay) pay.click();
+      else { const form = document.getElementById('payment-form'); if (form) form.submit(); }
+    });
+
+    // Step 4: Wait for something to happen
+    await page.waitForNavigation({ timeout: 15000, waitUntil: 'networkidle2' }).catch(() => {});
+    
+    const afterSubmitUrl = page.url();
+    
+    // Wait a bit more for 3DS challenge to load
+    await _delay(5000);
+
+    // Step 5: Capture ALL frame contents
+    const frameData = [];
+    for (const frame of page.frames()) {
+      const fUrl = frame.url();
+      const isMain = frame === page.mainFrame();
+      try {
+        const data = await frame.evaluate(() => {
+          const btns = [...document.querySelectorAll('button, input[type="submit"], a.button, input[type="button"]')].map(b => ({
+            tag: b.tagName, type: b.type || '', text: (b.textContent || b.value || '').trim().substring(0, 100),
+            id: b.id, className: b.className, name: b.name || '',
+            visible: b.offsetWidth > 0 && b.offsetHeight > 0,
+            display: window.getComputedStyle(b).display, visibility: window.getComputedStyle(b).visibility
+          }));
+          const forms = [...document.querySelectorAll('form')].map(f => ({
+            action: f.action, method: f.method, id: f.id
+          }));
+          const inputs = [...document.querySelectorAll('input, select, textarea')].map(el => ({
+            tag: el.tagName, type: el.type, name: el.name, id: el.id,
+            visible: el.offsetWidth > 0 && el.offsetHeight > 0
+          }));
+          const iframes = [...document.querySelectorAll('iframe')].map(f => ({
+            src: f.src, id: f.id, name: f.name
+          }));
+          return {
+            bodyText: (document.body?.innerText || '').substring(0, 2000),
+            html: document.documentElement?.outerHTML?.substring(0, 5000) || '',
+            btns, forms, inputs, iframes
+          };
+        }).catch(() => ({ error: 'evaluate failed' }));
+        frameData.push({ url: fUrl, isMain, ...data });
+      } catch (e) {
+        frameData.push({ url: fUrl, isMain, error: e.message });
+      }
+    }
+
+    await page.close().catch(() => {});
+
+    res.json({
+      redirectUrl: d.redirectUrl,
+      afterSubmitUrl,
+      currentUrl: afterSubmitUrl,
+      frameCount: frameData.length,
+      frames: frameData
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message, stack: e.stack?.substring(0, 500) });
+  }
+});
+
 // ═════════════════════════════════════════════════════════════════════════════
 // ENDPOINT: GET /api/cert/hpp-debug
 // ═════════════════════════════════════════════════════════════════════════════
