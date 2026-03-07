@@ -1323,6 +1323,28 @@ app.get('/cert-error', (_req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
+// ENDPOINT: GET /api/cert/puppeteer-check
+// Quick health check: can Puppeteer launch Chrome and load a page?
+app.get('/api/cert/puppeteer-check', async (_req, res) => {
+  const info = { puppeteerLoaded: !!puppeteer, chromiumPath: process.env.CHROMIUM_PATH || '/usr/bin/chromium' };
+  try {
+    const browser = await getHPPBrowser();
+    info.browserConnected = browser.isConnected();
+    const page = await browser.newPage();
+    await page.goto('https://example.com', { waitUntil: 'networkidle2', timeout: 15000 });
+    info.pageTitle = await page.title();
+    info.pageUrl = page.url();
+    await page.close();
+    info.ok = true;
+  } catch (e) {
+    info.ok = false;
+    info.error = e.message;
+    info.stack = e.stack?.substring(0, 500);
+  }
+  res.json(info);
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
 // ENDPOINT: GET /api/cert/hpp-debug
 // ═════════════════════════════════════════════════════════════════════════════
 // Diagnostic: create a throwaway debit, load the HPP in headless Chrome,
