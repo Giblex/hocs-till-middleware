@@ -279,30 +279,68 @@ async function completeHPP(redirectUrl, cardNumber = '4111111111111111') {
       return { completed: false, error: 'No submit button found', url: page.url() };
     }
 
-    // ── Wait for navigation / redirect ──
-    await page.waitForNavigation({ timeout: 30000, waitUntil: 'networkidle2' }).catch(() => {});
+    // ── Wait for navigation / redirect (shorter timeout — redirects are fast) ──
+    await page.waitForNavigation({ timeout: 15000, waitUntil: 'networkidle2' }).catch(() => {});
+
+    // ── Already at terminal URL? ──
+    if (/cert-paid|cert-error|cert-cancelled/.test(page.url())) {
+      const finalUrl = page.url();
+      logger.info('[HPP] done', { url: finalUrl, completed: /cert-paid/.test(finalUrl) });
+      return { completed: /cert-paid/.test(finalUrl), url: finalUrl };
+    }
+
+    // ── Detect inline error on HPP (e.g. declined card — no redirect) ──
+    const inlineError = await page.evaluate(() => {
+      const text = (document.body?.innerText || '').toLowerCase();
+      return /declined|do not hon|invalid card|transaction.{0,10}(failed|error)|not sufficient|card.{0,10}refused|error.{0,10}occurred/i.test(text)
+        ? text.substring(0, 300) : null;
+    }).catch(() => null);
+
+    if (inlineError) {
+      logger.info('[HPP] inline error detected (decline card)', { preview: inlineError.substring(0, 100) });
+      return { completed: false, url: page.url(), error: 'HPP inline error (decline)' };
+    }
 
     // ── Handle 3DS challenge or intermediate pages ──
     for (let i = 0; i < 4 && !/cert-paid|cert-error|cert-cancelled/.test(page.url()); i++) {
       logger.info('[HPP] intermediate page', { url: page.url(), attempt: i });
-      await _delay(3000);
+      await _delay(2000);
 
-      const clickedChallenge = await page.evaluate(() => {
-        const btns = [...document.querySelectorAll('button, input[type="submit"]')];
-        const btn = btns.find(b => { const s = window.getComputedStyle(b); return s.display !== 'none' && s.visibility !== 'hidden' && b.offsetWidth > 0; });
-        if (btn) { btn.click(); return true; }
-        const form = document.querySelector('form');
-        if (form) { form.submit(); return true; }
-        return false;
-      }).catch(() => false);
+      // Check all frames for 3DS challenge forms (ACS simulator has simple submit)
+      let clickedChallenge = false;
+      for (const frame of page.frames()) {
+        clickedChallenge = await frame.evaluate(() => {
+          const btns = [...document.querySelectorAll('button, input[type="submit"]')];
+          const btn = btns.find(b => {
+            const s = window.getComputedStyle(b);
+            return s.display !== 'none' && s.visibility !== 'hidden' && b.offsetWidth > 0;
+          });
+          if (btn) { btn.click(); return true; }
+          const form = document.querySelector('form');
+          if (form) { form.submit(); return true; }
+          return false;
+        }).catch(() => false);
+        if (clickedChallenge) break;
+      }
 
       if (clickedChallenge) {
-        await page.waitForNavigation({ timeout: 20000, waitUntil: 'networkidle2' }).catch(() => {});
+        await page.waitForNavigation({ timeout: 15000, waitUntil: 'networkidle2' }).catch(() => {});
       } else {
+        // No button found — wait briefly for auto-redirect
         await page.waitForFunction(
           'location.href.includes("cert-paid") || location.href.includes("cert-error") || location.href.includes("cert-cancelled")',
-          { timeout: 15000 }
+          { timeout: 8000 }
         ).catch(() => {});
+      }
+
+      // Re-check for inline error after each attempt (payment might process mid-loop)
+      const loopError = await page.evaluate(() => {
+        const text = (document.body?.innerText || '').toLowerCase();
+        return /declined|do not hon|invalid card|transaction.{0,10}(failed|error)|not sufficient|card.{0,10}refused/i.test(text);
+      }).catch(() => false);
+      if (loopError) {
+        logger.info('[HPP] inline error detected in loop', { attempt: i });
+        return { completed: false, url: page.url(), error: 'HPP inline error (decline)' };
       }
     }
 
@@ -1396,7 +1434,9 @@ app.get('/api/cert/run-all', async (_req, res) => {
     try {
       const r = await callTillAPI(method, path, body);
       const d = r.body || {};
-      return { label, success: d.success !== false && !(d.errors && d.errors.length), uuid: d.uuid || d.registrationId || null, redirectUrl: d.redirectUrl || null, raw: d };
+      const success = d.success !== false && !(d.errors && d.errors.length);
+      if (!success) logger.warn('[CERT] test returned error', { label, status: r.status, errors: d.errors, returnType: d.returnType, code: d.code });
+      return { label, success, uuid: d.uuid || d.registrationId || null, redirectUrl: d.redirectUrl || null, raw: d };
     } catch (e) {
       return { label, success: false, uuid: null, redirectUrl: null, raw: { error: e.message } };
     }
@@ -1478,7 +1518,7 @@ app.get('/api/cert/run-all', async (_req, res) => {
   await closeHPPBrowser();
 
   const hppAuto   = results.filter(r => r.hppCompleted).length;
-  const hppFailed = results.filter(r => r.needsManual).length;
+  const hppFailed = results.filter(r => r.needsManual && !/Negative/i.test(r.label)).length;
   logger.info('[CERT] run-all done', { total: results.length, hppAuto, hppFailed });
   res.json({ ok: true, results, hppAuto, hppFailed });
 });
