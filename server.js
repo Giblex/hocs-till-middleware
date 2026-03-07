@@ -232,90 +232,46 @@ async function completeHPP(redirectUrl, cardNumber = '4111111111111111') {
     if (/cert-paid|cert-error|cert-cancelled/.test(page.url()))
       return { completed: /cert-paid/.test(page.url()), url: page.url() };
 
-    // Give JS time to render the payment form
-    await _delay(3000);
+    // Give JS / Ixopay vault iframes time to initialise
+    await _delay(4000);
 
-    // ── Find the frame (main or iframe) that contains card inputs ──
-    const allFrames = [page.mainFrame(), ...page.frames().filter(f => f !== page.mainFrame())];
-    let cardFrame = null;
-    for (const frame of allFrames) {
-      const hasCard = await frame.evaluate(() => {
-        const inputs = document.querySelectorAll('input');
-        return [...inputs].some(i => {
-          const a = [i.name, i.id, i.className, i.autocomplete || '', i.placeholder || ''].join(' ').toLowerCase();
-          return /card|number|pan|cc-number/.test(a) && !/phone|zip|postal/.test(a);
-        });
-      }).catch(() => false);
-      if (hasCard) { cardFrame = frame; break; }
+    // ── Fill main-frame fields: first name, last name, expiry selects ──
+    const firstName = await page.$('#first_name');
+    const lastName  = await page.$('#last_name');
+    if (firstName) { await firstName.click({ clickCount: 3 }); await firstName.type('Test'); }
+    if (lastName)  { await lastName.click({ clickCount: 3 }); await lastName.type('Customer'); }
+    await page.select('#month', '12').catch(() => {});
+    await page.select('#year', '2030').catch(() => {});
+
+    // ── Card number: inside Ixopay secure vault iframe (pan.html) ──
+    const panFrame = page.frames().find(f => /\/iframes\/pan/i.test(f.url()));
+    if (panFrame) {
+      const panInput = await panFrame.waitForSelector('input', { timeout: 5000 }).catch(() => null);
+      if (panInput) { await panInput.click(); await panInput.type(cardNumber); }
+      else logger.warn('[HPP] no input inside PAN iframe');
+    } else {
+      logger.warn('[HPP] PAN iframe not found', { frames: page.frames().map(f => f.url()) });
     }
 
-    if (!cardFrame) {
-      const html = await page.content();
-      logger.warn('[HPP] no card input found', { url: page.url(), htmlLen: html.length, snippet: html.substring(0, 3000) });
-      return { completed: false, error: 'No card input found', url: page.url() };
+    // ── CVV: inside a separate vault iframe (cvv.html) ──
+    const cvvFrame = page.frames().find(f => /\/iframes\/cvv/i.test(f.url()));
+    if (cvvFrame) {
+      const cvvInput = await cvvFrame.waitForSelector('input', { timeout: 5000 }).catch(() => null);
+      if (cvvInput) { await cvvInput.click(); await cvvInput.type('123'); }
+      else logger.warn('[HPP] no input inside CVV iframe');
+    } else {
+      logger.warn('[HPP] CVV iframe not found', { frames: page.frames().map(f => f.url()) });
     }
-
-    // ── Fill every field in one evaluate call ──
-    await cardFrame.evaluate((cn) => {
-      function setVal(el, v) {
-        el.focus();
-        el.value = v;
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-        el.dispatchEvent(new Event('blur', { bubbles: true }));
-      }
-      const els = document.querySelectorAll('input, select');
-      for (const el of els) {
-        const a = [el.name, el.id, el.className, el.autocomplete || '', el.placeholder || ''].join(' ').toLowerCase();
-        const isInput  = el.tagName === 'INPUT';
-        const isSelect = el.tagName === 'SELECT';
-
-        // Card number
-        if (isInput && /card.?number|pan|cc-number|creditcard/.test(a) && !/phone/.test(a)) {
-          setVal(el, cn);
-        }
-        // Expiry month
-        else if (/exp.*month|month.*exp|cc-exp-month/.test(a)) {
-          if (isSelect) {
-            const opt = [...el.options].find(o => o.value === '12' || o.text.includes('12'));
-            if (opt) { el.value = opt.value; el.dispatchEvent(new Event('change', { bubbles: true })); }
-          } else setVal(el, '12');
-        }
-        // Expiry year
-        else if (/exp.*year|year.*exp|cc-exp-year/.test(a)) {
-          if (isSelect) {
-            const opt = [...el.options].find(o => /2030|30/.test(o.value));
-            if (opt) { el.value = opt.value; el.dispatchEvent(new Event('change', { bubbles: true })); }
-          } else setVal(el, '2030');
-        }
-        // Combined expiry (MM/YY or MMYY)
-        else if (isInput && /expir|cc-exp/.test(a) && !/month|year/.test(a)) {
-          setVal(el, '12/30');
-        }
-        // CVV / CVC
-        else if (isInput && /cvv|cvc|secur|verif|cc-csc/.test(a)) {
-          setVal(el, '123');
-        }
-        // Cardholder name
-        else if (isInput && /holder|card.*name|name.*card|cc-name/.test(a)) {
-          setVal(el, 'Test Customer');
-        }
-      }
-    }, cardNumber);
 
     logger.info('[HPP] form filled, submitting');
 
-    // ── Click submit / pay button ──
-    const clicked = await cardFrame.evaluate(() => {
-      const btns = [...document.querySelectorAll('button, input[type="submit"], a.btn, a.button')];
-      const payBtn = btns.find(b => {
-        const t = (b.textContent || b.value || '').toLowerCase();
-        const s = window.getComputedStyle(b);
-        return /pay|submit|confirm|continue|proceed/.test(t) && s.display !== 'none' && s.visibility !== 'hidden';
-      }) || btns.find(b => b.type === 'submit' && window.getComputedStyle(b).display !== 'none');
-      if (payBtn) { payBtn.click(); return true; }
-      const form = document.querySelector('form');
-      if (form) { form.submit(); return true; }
+    // ── Click Submit (triggers Ixopay.PaymentFormV2.submitPaymentForm) ──
+    const clicked = await page.evaluate(() => {
+      const btns = [...document.querySelectorAll('button, input[type="submit"]')];
+      const pay = btns.find(b => /submit|pay/i.test((b.textContent || b.value || '').trim()));
+      if (pay) { pay.click(); return 'btn'; }
+      const form = document.getElementById('payment-form');
+      if (form) { form.requestSubmit ? form.requestSubmit() : form.submit(); return 'form'; }
       return false;
     });
 
@@ -331,7 +287,6 @@ async function completeHPP(redirectUrl, cardNumber = '4111111111111111') {
       logger.info('[HPP] intermediate page', { url: page.url(), attempt: i });
       await _delay(3000);
 
-      // Try clicking any visible submit / continue button
       const clickedChallenge = await page.evaluate(() => {
         const btns = [...document.querySelectorAll('button, input[type="submit"]')];
         const btn = btns.find(b => { const s = window.getComputedStyle(b); return s.display !== 'none' && s.visibility !== 'hidden' && b.offsetWidth > 0; });
@@ -344,7 +299,6 @@ async function completeHPP(redirectUrl, cardNumber = '4111111111111111') {
       if (clickedChallenge) {
         await page.waitForNavigation({ timeout: 20000, waitUntil: 'networkidle2' }).catch(() => {});
       } else {
-        // Wait for auto-redirect (some 3DS pages auto-submit)
         await page.waitForFunction(
           'location.href.includes("cert-paid") || location.href.includes("cert-error") || location.href.includes("cert-cancelled")',
           { timeout: 15000 }
