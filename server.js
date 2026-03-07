@@ -750,8 +750,8 @@ app.use('/api/payment-redirect-by-shopify-id', (req, res, next) => {
 app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
-    version: '1.4.3',
-    build: 'add-missing-cert-tests',
+    version: '1.4.4',
+    build: 'remove-pci-direct-na',
     env: NODE_ENV,
     till_base: TILL_BASE_URL.includes('test-gateway') ? 'sandbox' : 'production'
   });
@@ -1669,9 +1669,7 @@ app.get('/api/cert/run-all', async (req, res) => {
   const rev  = d_1g.uuid && d_1g.hppCompleted ? await run('8 – Reversal',         'POST', BASE+'/refund',                   { merchantTransactionId:ts(), referenceUuid:d_1g.uuid, amount:'1.00', currency:'AUD', description:'Reversal (full refund)' }) : FAIL('8 – Reversal',         'Debit 1.g HPP not completed');
   const inc  = p_2h.uuid && p_2h.hppCompleted ? await run('9 – Incremental auth', 'POST', BASE+'/incrementalAuthorization', { merchantTransactionId:ts(), referenceUuid:p_2h.uuid, amount:'0.25', currency:'AUD' })                              : FAIL('9 – Incremental auth', 'Preauth 2.h HPP not completed');
 
-  // ═══ Phase 4b: PCI Direct (send card data directly — requires PCI DSS on account) ═══
-  const d_1i = await run('1.i – Debit PCI Direct (PAN)', 'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'HOC Cert 1.i PCI Direct', customer:CUST, callbackUrl: CALLBACK_URL, cardData:{ cardHolder:'Test Customer', pan:'4111111111111111', expirationMonth:'12', expirationYear:'2030', cvv:'123' } });
-  const p_2i = await run('2.i – Preauth PCI Direct (PAN)', 'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'HOC Cert 2.i PCI Direct', customer:CUST, callbackUrl: CALLBACK_URL, cardData:{ cardHolder:'Test Customer', pan:'4111111111111111', expirationMonth:'12', expirationYear:'2030', cvv:'123' } });
+  // PCI Direct (1.i / 2.i) — N/A: Till sandbox rejects cardData (error 1002 additionalProperties:false)
 
   // ═══ Phase 5: Negative tests (decline card — HPP auto-completed) ═══
   // Close & re-open browser between EACH negative test to avoid detached-frame errors
@@ -1684,14 +1682,14 @@ app.get('/api/cert/run-all', async (req, res) => {
 
   // ═══ Assemble results in display order (must match dashboard sections) ═══
   const results = [
-    d_1a, d_1b, d_1c, d_1d, d_1e, d_1f, d_1g, d_1h, d_1_4k, d_1i,  // 0-9   Debits (incl 4000 card + PCI Direct)
-    p_2a, p_2b, p_2c, p_2d, p_2e, p_2f, p_2g, p_2h, p_2_4k, p_2i,  // 10-19 Preauths (incl 4000 card + PCI Direct)
-    cap, capP, vd,                                                    // 20-22 Capture/Void
-    t5, t5_3ds, d_reg1, d_reg2, dereg,                                // 23-27 Register/Deregister
-    reful, refPa,                                                      // 28-29 Refunds
-    rev,                                                               // 30    Reversal
-    inc,                                                               // 31    Incremental
-    t10a, t10b, t10c                                                   // 32-34 Negatives
+    d_1a, d_1b, d_1c, d_1d, d_1e, d_1f, d_1g, d_1h, d_1_4k,  // 0-8   Debits (incl 4000 card)
+    p_2a, p_2b, p_2c, p_2d, p_2e, p_2f, p_2g, p_2h, p_2_4k,  // 9-17  Preauths (incl 4000 card)
+    cap, capP, vd,                                              // 18-20 Capture/Void
+    t5, t5_3ds, d_reg1, d_reg2, dereg,                          // 21-25 Register/Deregister
+    reful, refPa,                                                // 26-27 Refunds
+    rev,                                                         // 28    Reversal
+    inc,                                                         // 29    Incremental
+    t10a, t10b, t10c                                             // 30-32 Negatives
   ];
 
   // Clean up shared Puppeteer browser
@@ -1886,14 +1884,14 @@ function renderSep(text){
 function renderAll(results){
   const body = document.getElementById('results-body');
   const sections = [
-    { label:'Tests 1.a–1.i · Debit', startIdx:0, count:10 },
-    { label:'Tests 2.a–2.i · Preauth', startIdx:10, count:10 },
-    { label:'Test 3 · Capture / Test 4 · Void', startIdx:20, count:3 },
-    { label:'Test 5 · Register / Debit from Register / Deregister', startIdx:23, count:5 },
-    { label:'Tests 6–7 · Refund', startIdx:28, count:2 },
-    { label:'Test 8 · Reversal', startIdx:30, count:1 },
-    { label:'Test 9 · Incremental Auth', startIdx:31, count:1 },
-    { label:'Test 10 · Negative (Declined)', startIdx:32, count:3 },
+    { label:'Tests 1.a–1.h · Debit', startIdx:0, count:9 },
+    { label:'Tests 2.a–2.h · Preauth', startIdx:9, count:9 },
+    { label:'Test 3 · Capture / Test 4 · Void', startIdx:18, count:3 },
+    { label:'Test 5 · Register / Debit from Register / Deregister', startIdx:21, count:5 },
+    { label:'Tests 6–7 · Refund', startIdx:26, count:2 },
+    { label:'Test 8 · Reversal', startIdx:28, count:1 },
+    { label:'Test 9 · Incremental Auth', startIdx:29, count:1 },
+    { label:'Test 10 · Negative (Declined)', startIdx:30, count:3 },
   ];
 
   let html='';
@@ -2027,10 +2025,10 @@ async function rerunDependent(){
   // Patch lastResults at their positions and re-render
   const positions = {
     '1.b – Debit RECURRING': 1, '1.c – Debit CARDONFILE': 2, '1.d – Debit CARDONFILE-MERCHANT-INIT': 3,
-    '2.b – Preauth RECURRING': 11, '2.c – Preauth CARDONFILE': 12, '2.d – Preauth CARDONFILE-MERCHANT-INIT': 13,
-    '3 – Capture full': 20, '3.a – Capture partial': 21, '4 – Void preauth': 22,
-    '5.a – Deregister': 27,
-    '6 – Full refund': 28, '7 – Partial refund': 29, '8 – Reversal': 30, '9 – Incremental auth': 31
+    '2.b – Preauth RECURRING': 10, '2.c – Preauth CARDONFILE': 11, '2.d – Preauth CARDONFILE-MERCHANT-INIT': 12,
+    '3 – Capture full': 18, '3.a – Capture partial': 19, '4 – Void preauth': 20,
+    '5.a – Deregister': 25,
+    '6 – Full refund': 26, '7 – Partial refund': 27, '8 – Reversal': 28, '9 – Incremental auth': 29
   };
   for(const dr of depResults){
     for(const [key, idx] of Object.entries(positions)){
