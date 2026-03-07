@@ -750,7 +750,7 @@ app.use('/api/payment-redirect-by-shopify-id', (req, res, next) => {
 app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
-    version: '1.4.5',
+    version: '1.4.6',
     build: 'add-1.0-2.0-plain-tests',
     env: NODE_ENV,
     till_base: TILL_BASE_URL.includes('test-gateway') ? 'sandbox' : 'production'
@@ -1676,6 +1676,8 @@ app.get('/api/cert/run-all', async (req, res) => {
   // ═══ Phase 5: Negative tests (decline card — HPP auto-completed) ═══
   // Close & re-open browser between EACH negative test to avoid detached-frame errors
   await closeHPPBrowser();
+  const t10  = await runHPP('10 – Negative debit (decline)',  'POST', BASE+'/debit',        { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'HOC Cert 10 Negative', customer:CUST, ...URLS }, '4111111111111119');
+  await closeHPPBrowser();
   const t10a = await runHPP('10.a – Negative debit',    'POST', BASE+'/debit',        { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'HOC Cert 10.a Negative', customer:CUST, ...URLS }, '4111111111111119');
   await closeHPPBrowser();
   const t10b = await runHPP('10.b – Negative preauth',  'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'SINGLE', description:'HOC Cert 10.b Negative', customer:CUST, ...URLS }, '4111111111111119');
@@ -1691,7 +1693,7 @@ app.get('/api/cert/run-all', async (req, res) => {
     reful, refPa,                                                // 28-29 Refunds
     rev,                                                         // 30    Reversal
     inc,                                                         // 31    Incremental
-    t10a, t10b, t10c                                             // 32-34 Negatives
+    t10, t10a, t10b, t10c                                        // 32-35 Negatives
   ];
 
   // Clean up shared Puppeteer browser
@@ -1893,7 +1895,7 @@ function renderAll(results){
     { label:'Tests 6–7 · Refund', startIdx:28, count:2 },
     { label:'Test 8 · Reversal', startIdx:30, count:1 },
     { label:'Test 9 · Incremental Auth', startIdx:31, count:1 },
-    { label:'Test 10 · Negative (Declined)', startIdx:32, count:3 },
+    { label:'Test 10 · Negative (Declined)', startIdx:32, count:4 },
   ];
 
   let html='';
@@ -1912,9 +1914,9 @@ async function runAll(){
   btn.disabled=true; btn.textContent='Running…';
   setStatus('Fully automated: creating transactions, auto-completing HPP pages, running downstream tests… ~5 minutes.');
   startTimer();
-  showProgress('Running all 35 tests (HPP auto-completed)…', 0);
+  showProgress('Running all 36 tests (HPP auto-completed)…', 0);
   const estMs = 260000; const t0 = Date.now();
-  const pInt = setInterval(()=>{ const pct=Math.min(((Date.now()-t0)/estMs)*95,95); showProgress('Running all 35 tests (HPP auto-completed)…',pct); },400);
+  const pInt = setInterval(()=>{ const pct=Math.min(((Date.now()-t0)/estMs)*95,95); showProgress('Running all 36 tests (HPP auto-completed)…',pct); },400);
   try {
     const resp = await fetch('/api/cert/run-all');
     clearInterval(pInt); showProgress('Processing results…',100);
