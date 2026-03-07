@@ -1299,6 +1299,30 @@ app.get('/api/cert/puppeteer-check', async (_req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
+// ENDPOINT: GET /api/cert/hpp-test
+// ═════════════════════════════════════════════════════════════════════════════
+// Creates a throwaway debit and runs the REAL completeHPP() flow on it.
+app.get('/api/cert/hpp-test', async (_req, res) => {
+  try {
+    const ts = `HPP-TEST-${Date.now()}`;
+    const BASE = `/api/v3/transaction/${TILL_API_KEY}`;
+    const r = await callTillAPI('POST', BASE + '/debit', {
+      merchantTransactionId: ts, amount: '1.00', currency: 'AUD',
+      transactionIndicator: 'SINGLE', description: 'HPP Auto-Test',
+      customer: { firstName: 'Test', lastName: 'Auto', email: 'auto@test.com', ipAddress: '127.0.0.1', billingCountry: 'AU' },
+      successUrl: CERT_SUCCESS_URL, cancelUrl: CERT_CANCEL_URL, errorUrl: CERT_ERROR_URL, callbackUrl: CALLBACK_URL
+    });
+    const d = r.body || {};
+    if (!d.redirectUrl) return res.json({ error: 'No redirectUrl from Till', raw: d });
+
+    const hpp = await completeHPP(d.redirectUrl, '4111111111111111');
+    res.json({ redirectUrl: d.redirectUrl, uuid: d.uuid, hppResult: hpp });
+  } catch (e) {
+    res.status(500).json({ error: e.message, stack: e.stack?.substring(0, 500) });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
 // ENDPOINT: GET /api/cert/hpp-debug
 // ═════════════════════════════════════════════════════════════════════════════
 // Diagnostic: create a throwaway debit, load the HPP in headless Chrome,
