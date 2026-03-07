@@ -302,14 +302,44 @@ async function completeHPP(redirectUrl, cardNumber = '4111111111111111') {
     }
 
     // ── Handle 3DS challenge or intermediate pages ──
-    for (let i = 0; i < 4 && !/cert-paid|cert-error|cert-cancelled/.test(page.url()); i++) {
-      logger.info('[HPP] intermediate page', { url: page.url(), attempt: i });
-      await _delay(2000);
+    for (let i = 0; i < 6 && !/cert-paid|cert-error|cert-cancelled/.test(page.url()); i++) {
+      const frameUrls = page.frames().map(f => f.url());
+      logger.info('[HPP] intermediate page', { url: page.url(), attempt: i, frames: frameUrls });
+      await _delay(3000);
 
-      // Check all frames for 3DS challenge forms (ACS simulator has simple submit)
+      // Check child frames for 3DS challenge forms — skip main frame (has payment
+      // form Submit button that would re-trigger) and skip vault iframes.
       let clickedChallenge = false;
+      const mainUrl = page.url();
       for (const frame of page.frames()) {
+        const fUrl = frame.url();
+        // Skip main frame if still on the payment page (has its own Submit btn)
+        if (frame === page.mainFrame() && /tillpayments\.com\/payment\//i.test(fUrl)) continue;
+        // Skip vault iframes — they hold PAN / CVV inputs, not 3DS
+        if (/\/iframes\/(pan|cvv)\.html/i.test(fUrl)) continue;
+        // Skip about:blank / empty frames
+        if (!fUrl || fUrl === 'about:blank') continue;
+
         clickedChallenge = await frame.evaluate(() => {
+          const btns = [...document.querySelectorAll('button, input[type="submit"], a.button')];
+          const btn = btns.find(b => {
+            const s = window.getComputedStyle(b);
+            return s.display !== 'none' && s.visibility !== 'hidden' && b.offsetWidth > 0;
+          });
+          if (btn) { btn.click(); return true; }
+          const form = document.querySelector('form');
+          if (form) { form.submit(); return true; }
+          return false;
+        }).catch(() => false);
+        if (clickedChallenge) {
+          logger.info('[HPP] clicked 3DS challenge button', { frameUrl: fUrl });
+          break;
+        }
+      }
+
+      // If no child-frame button found, check main frame ONLY if URL changed from payment page
+      if (!clickedChallenge && !/tillpayments\.com\/payment\//i.test(page.url())) {
+        clickedChallenge = await page.evaluate(() => {
           const btns = [...document.querySelectorAll('button, input[type="submit"]')];
           const btn = btns.find(b => {
             const s = window.getComputedStyle(b);
@@ -320,16 +350,17 @@ async function completeHPP(redirectUrl, cardNumber = '4111111111111111') {
           if (form) { form.submit(); return true; }
           return false;
         }).catch(() => false);
-        if (clickedChallenge) break;
+        if (clickedChallenge) logger.info('[HPP] clicked 3DS button in main frame (navigated)', { url: page.url() });
       }
 
       if (clickedChallenge) {
-        await page.waitForNavigation({ timeout: 15000, waitUntil: 'networkidle2' }).catch(() => {});
+        await page.waitForNavigation({ timeout: 20000, waitUntil: 'networkidle2' }).catch(() => {});
       } else {
-        // No button found — wait briefly for auto-redirect
+        // No button found — wait for auto-redirect
+        logger.info('[HPP] no 3DS button found, waiting for redirect…', { url: page.url() });
         await page.waitForFunction(
           'location.href.includes("cert-paid") || location.href.includes("cert-error") || location.href.includes("cert-cancelled")',
-          { timeout: 8000 }
+          { timeout: 10000 }
         ).catch(() => {});
       }
 
@@ -1475,17 +1506,18 @@ app.get('/api/cert/run-all', async (_req, res) => {
   const t5   = await runHPP('5 – Register card', 'POST', BASE+'/register', { merchantTransactionId:ts(), customer:CUST, ...URLS });
 
   // ═══ Phase 2: Settle wait — give Till time to process HPP completions ═══
-  logger.info('[CERT] Waiting 15s for HPP settlements…');
-  await sleep(15000);
+  logger.info('[CERT] Waiting 25s for HPP settlements…');
+  await sleep(25000);
 
   // ═══ Phase 3: RECURRING / CARDONFILE (server-to-server, need 1.a / 2.a HPP done) ═══
   const refD = d_1a.uuid, refPA = p_2a.uuid;
-  const d_1b = await run('1.b – Debit RECURRING',                 'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'RECURRING',                    description:'HOC Cert 1.b', customer:CUST, callbackUrl: CALLBACK_URL, ...(refD ? {referenceUuid:refD}:{}) });
-  const d_1c = await run('1.c – Debit CARDONFILE',                'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE',                   description:'HOC Cert 1.c', customer:CUST, callbackUrl: CALLBACK_URL, ...(refD ? {referenceUuid:refD}:{}) });
-  const d_1d = await run('1.d – Debit CARDONFILE-MERCHANT-INIT',  'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE-MERCHANT-INITIATED', description:'HOC Cert 1.d', customer:CUST, callbackUrl: CALLBACK_URL, ...(refD ? {referenceUuid:refD}:{}) });
-  const p_2b = await run('2.b – Preauth RECURRING',                'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'RECURRING',                    description:'HOC Cert 2.b', customer:CUST, callbackUrl: CALLBACK_URL, ...(refPA ? {referenceUuid:refPA}:{}) });
-  const p_2c = await run('2.c – Preauth CARDONFILE',               'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE',                   description:'HOC Cert 2.c', customer:CUST, callbackUrl: CALLBACK_URL, ...(refPA ? {referenceUuid:refPA}:{}) });
-  const p_2d = await run('2.d – Preauth CARDONFILE-MERCHANT-INIT', 'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE-MERCHANT-INITIATED', description:'HOC Cert 2.d', customer:CUST, callbackUrl: CALLBACK_URL, ...(refPA ? {referenceUuid:refPA}:{}) });
+  logger.info('[CERT] Phase 3 refs', { refD, refPA, d1aHPP: d_1a.hppCompleted, p2aHPP: p_2a.hppCompleted });
+  const d_1b = (refD && d_1a.hppCompleted) ? await run('1.b – Debit RECURRING',                 'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'RECURRING',                    description:'HOC Cert 1.b', customer:CUST, callbackUrl: CALLBACK_URL, referenceUuid:refD }) : FAIL('1.b – Debit RECURRING', 'Debit 1.a HPP not completed');
+  const d_1c = (refD && d_1a.hppCompleted) ? await run('1.c – Debit CARDONFILE',                'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE',                   description:'HOC Cert 1.c', customer:CUST, callbackUrl: CALLBACK_URL, referenceUuid:refD }) : FAIL('1.c – Debit CARDONFILE', 'Debit 1.a HPP not completed');
+  const d_1d = (refD && d_1a.hppCompleted) ? await run('1.d – Debit CARDONFILE-MERCHANT-INIT',  'POST', BASE+'/debit', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE-MERCHANT-INITIATED', description:'HOC Cert 1.d', customer:CUST, callbackUrl: CALLBACK_URL, referenceUuid:refD }) : FAIL('1.d – Debit CARDONFILE-MERCHANT-INIT', 'Debit 1.a HPP not completed');
+  const p_2b = (refPA && p_2a.hppCompleted) ? await run('2.b – Preauth RECURRING',                'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'RECURRING',                    description:'HOC Cert 2.b', customer:CUST, callbackUrl: CALLBACK_URL, referenceUuid:refPA }) : FAIL('2.b – Preauth RECURRING', 'Preauth 2.a HPP not completed');
+  const p_2c = (refPA && p_2a.hppCompleted) ? await run('2.c – Preauth CARDONFILE',               'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE',                   description:'HOC Cert 2.c', customer:CUST, callbackUrl: CALLBACK_URL, referenceUuid:refPA }) : FAIL('2.c – Preauth CARDONFILE', 'Preauth 2.a HPP not completed');
+  const p_2d = (refPA && p_2a.hppCompleted) ? await run('2.d – Preauth CARDONFILE-MERCHANT-INIT', 'POST', BASE+'/preauthorize', { merchantTransactionId:ts(), amount:'1.00', currency:'AUD', transactionIndicator:'CARDONFILE-MERCHANT-INITIATED', description:'HOC Cert 2.d', customer:CUST, callbackUrl: CALLBACK_URL, referenceUuid:refPA }) : FAIL('2.d – Preauth CARDONFILE-MERCHANT-INIT', 'Preauth 2.a HPP not completed');
 
   // ═══ Phase 4: Downstream tests (need HPP completed on source transactions) ═══
   const cap  = p_2e.uuid && p_2e.hppCompleted ? await run('3 – Capture full',     'POST', BASE+'/capture',                  { merchantTransactionId:ts(), referenceUuid:p_2e.uuid, amount:'1.00', currency:'AUD' })                              : FAIL('3 – Capture full',     'Preauth 2.e HPP not completed');
@@ -1667,13 +1699,14 @@ function renderRow(r, idx){
 
   // Remark: for HPP tests before payment, note UUID + "complete HPP to activate"
   // For tests that succeeded, just use UUID. For dependent (capture/void etc), use uuid from this call.
+  const hppTag = r.hppCompleted === true ? ' | hpp=done' : r.hppCompleted === false ? ' | hpp=FAILED' : '';
   let remark;
   if (needsHPP && !success){
     remark = uuid ? \`uuid=\${uuid} | Complete HPP first, then re-run\` : 'Run HPP first';
   } else if (uuid && success) {
-    remark = \`uuid=\${uuid} | success=true\`;
+    remark = \`uuid=\${uuid} | success=true\${hppTag}\`;
   } else if (uuid && !success) {
-    remark = \`uuid=\${uuid} | ERROR: \${errInfo || 'see raw'}\`;
+    remark = \`uuid=\${uuid} | ERROR: \${errInfo || 'see raw'}\${hppTag}\`;
   } else if (!success && errInfo){
     remark = \`error: \${errInfo}\`;
   } else {
