@@ -233,7 +233,7 @@ async function completeHPP(redirectUrl, cardNumber = '4111111111111111', expectD
       return { completed: /cert-paid/.test(page.url()) || (expectDecline && /cert-error/.test(page.url())), url: page.url() };
 
     // Give JS / Ixopay vault iframes time to initialise
-    await _delay(4000);
+    await _delay(2000);
 
     // ── Fill main-frame fields: first name, last name, expiry selects ──
     const firstName = await page.$('#first_name');
@@ -306,7 +306,7 @@ async function completeHPP(redirectUrl, cardNumber = '4111111111111111', expectD
     for (let i = 0; i < 6 && !/cert-paid|cert-error|cert-cancelled/.test(page.url()); i++) {
       const frameUrls = page.frames().map(f => { try { return f.url(); } catch { return '(detached)'; } });
       logger.info('[HPP] intermediate page', { url: page.url(), attempt: i, frames: frameUrls });
-      await _delay(3000);
+      await _delay(1500);
 
       // Check child frames for 3DS challenge forms — skip main frame (has payment
       // form Submit button that would re-trigger) and skip vault iframes.
@@ -750,8 +750,8 @@ app.use('/api/payment-redirect-by-shopify-id', (req, res, next) => {
 app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
-    version: '1.4.1',
-    build: 'fix-keepalive-stream',
+    version: '1.4.2',
+    build: 'tighten-timing',
     env: NODE_ENV,
     till_base: TILL_BASE_URL.includes('test-gateway') ? 'sandbox' : 'production'
   });
@@ -1587,14 +1587,14 @@ app.get('/api/cert/run-all', async (req, res) => {
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
   async function run(label, method, path, body = {}) {
-    await sleep(18000);
+    await sleep(5000);
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         const r = await callTillAPI(method, path, body);
         const d = r.body || {};
         if (d.errorCode === 1009 && attempt < 2) {
           logger.warn('[CERT] rate limit, retrying', { label, attempt });
-          await sleep(15000);
+          await sleep(8000);
           continue;
         }
         const success = d.success !== false && !(d.errors && d.errors.length);
@@ -1640,8 +1640,8 @@ app.get('/api/cert/run-all', async (req, res) => {
   const t5   = await runHPP('5 – Register card', 'POST', BASE+'/register', { merchantTransactionId:ts(), customer:CUST, ...URLS });
 
   // ═══ Phase 2: Settle wait — give Till time to process HPP completions ═══
-  logger.info('[CERT] Waiting 40s for HPP settlements…');
-  await sleep(40000);
+  logger.info('[CERT] Waiting 15s for HPP settlements…');
+  await sleep(15000);
 
   // ═══ Phase 3: RECURRING / CARDONFILE (server-to-server, need 1.a / 2.a HPP done) ═══
   const refD = d_1a.uuid, refPA = p_2a.uuid;
@@ -1900,10 +1900,10 @@ function renderAll(results){
 async function runAll(){
   const btn = document.getElementById('run-btn');
   btn.disabled=true; btn.textContent='Running…';
-  setStatus('Fully automated: creating transactions, auto-completing HPP pages, running downstream tests… ~7 minutes.');
+  setStatus('Fully automated: creating transactions, auto-completing HPP pages, running downstream tests… ~4 minutes.');
   startTimer();
   showProgress('Running all 28 tests (HPP auto-completed)…', 0);
-  const estMs = 450000; const t0 = Date.now();
+  const estMs = 240000; const t0 = Date.now();
   const pInt = setInterval(()=>{ const pct=Math.min(((Date.now()-t0)/estMs)*95,95); showProgress('Running all 28 tests (HPP auto-completed)…',pct); },400);
   try {
     const resp = await fetch('/api/cert/run-all');
@@ -1955,45 +1955,45 @@ async function rerunDependent(){
   // ── RECURRING / CARDONFILE (needs 1.a / 2.a HPP completed first)
   stepProgress('Debit RECURRING (1.b)');
   const rec1b = debitInitialUuid   ? await post('/api/till/debit',   {transactionIndicator:'RECURRING',                    referenceUuid:debitInitialUuid,   amount:'1.00',currency:'AUD',merchantTransactionId:t(),descriptor:'HOC Cert 1.b'}) : {success:false,raw:{error:'No initial debit uuid — complete HPP on row 1 (1.a) first'}};
-  await sleep(10000);
+  await sleep(5000);
   stepProgress('Debit CARDONFILE (1.c)');
   const cof1c = debitInitialUuid   ? await post('/api/till/debit',   {transactionIndicator:'CARDONFILE',                   referenceUuid:debitInitialUuid,   amount:'1.00',currency:'AUD',merchantTransactionId:t(),descriptor:'HOC Cert 1.c'}) : {success:false,raw:{error:'No initial debit uuid — complete HPP on row 1 (1.a) first'}};
-  await sleep(10000);
+  await sleep(5000);
   stepProgress('Debit CARDONFILE-MI (1.d)');
   const cof1d = debitInitialUuid   ? await post('/api/till/debit',   {transactionIndicator:'CARDONFILE-MERCHANT-INITIATED', referenceUuid:debitInitialUuid,   amount:'1.00',currency:'AUD',merchantTransactionId:t(),descriptor:'HOC Cert 1.d'}) : {success:false,raw:{error:'No initial debit uuid — complete HPP on row 1 (1.a) first'}};
-  await sleep(10000);
+  await sleep(5000);
   stepProgress('Preauth RECURRING (2.b)');
   const rec2b = preauthInitialUuid ? await post('/api/till/preauth', {transactionIndicator:'RECURRING',                    referenceUuid:preauthInitialUuid, amount:'1.00',currency:'AUD',merchantTransactionId:t(),descriptor:'HOC Cert 2.b'}) : {success:false,raw:{error:'No initial preauth uuid — complete HPP on row 9 (2.a) first'}};
-  await sleep(10000);
+  await sleep(5000);
   stepProgress('Preauth CARDONFILE (2.c)');
   const cof2c = preauthInitialUuid ? await post('/api/till/preauth', {transactionIndicator:'CARDONFILE',                   referenceUuid:preauthInitialUuid, amount:'1.00',currency:'AUD',merchantTransactionId:t(),descriptor:'HOC Cert 2.c'}) : {success:false,raw:{error:'No initial preauth uuid — complete HPP on row 9 (2.a) first'}};
-  await sleep(10000);
+  await sleep(5000);
   stepProgress('Preauth CARDONFILE-MI (2.d)');
   const cof2d = preauthInitialUuid ? await post('/api/till/preauth', {transactionIndicator:'CARDONFILE-MERCHANT-INITIATED', referenceUuid:preauthInitialUuid, amount:'1.00',currency:'AUD',merchantTransactionId:t(),descriptor:'HOC Cert 2.d'}) : {success:false,raw:{error:'No initial preauth uuid — complete HPP on row 9 (2.a) first'}};
-  await sleep(10000);
+  await sleep(5000);
 
   // ── Capture / Void / Refund / Reversal / Incremental (needs 1.e / 2.e HPP completed first)
   stepProgress('Capture full (3)');
   const cap  = preauthUuid ? await post('/api/till/capture/'+preauthUuid,  {amount:'1.00',currency:'AUD',merchantTransactionId:t()}) : {success:false,raw:{error:'No preauth uuid'}};
-  await sleep(10000);
+  await sleep(5000);
   stepProgress('Capture partial (3a)');
   const capP = (preauthUuid2||preauthUuid) ? await post('/api/till/capture/'+(preauthUuid2||preauthUuid),  {amount:'0.50',currency:'AUD',merchantTransactionId:t()}) : {success:false,raw:{error:'No preauth uuid (complete HPP on 2.f)'}};
-  await sleep(10000);
+  await sleep(5000);
   stepProgress('Void preauth (4)');
   const vd   = (preauthUuid3||preauthUuid) ? await post('/api/till/void/'+(preauthUuid3||preauthUuid),     {}) : {success:false,raw:{error:'No preauth uuid (complete HPP on 2.g)'}};
-  await sleep(10000);
+  await sleep(5000);
   stepProgress('Deregister (5.a)');
   const dereg = regId5 ? await post('/api/till/deregister', {referenceUuid:regId5, merchantTransactionId:t()}) : {success:false,raw:{error:'No register uuid — complete HPP on Register (5) first'}};
-  await sleep(10000);
+  await sleep(5000);
   stepProgress('Full refund (6)');
   const ref  = debitUuid   ? await post('/api/till/refund/'+debitUuid,     {amount:'1.00',currency:'AUD',reason:'Customer refund request'}) : {success:false,raw:{error:'No debit uuid'}};
-  await sleep(10000);
+  await sleep(5000);
   stepProgress('Partial refund (7)');
   const refP = (debitUuid2||debitUuid)   ? await post('/api/till/refund/'+(debitUuid2||debitUuid),     {amount:'0.50',currency:'AUD',reason:'Partial refund'}) : {success:false,raw:{error:'No debit uuid (complete HPP on 1.f)'}};
-  await sleep(10000);
+  await sleep(5000);
   stepProgress('Reversal (8)');
   const rev  = (debitUuid3||debitUuid)   ? await post('/api/till/refund/'+(debitUuid3||debitUuid),   {amount:'1.00',currency:'AUD',reason:'Reversal (full refund)',merchantTransactionId:t()}) : {success:false,raw:{error:'No debit uuid (complete HPP on 1.g)'}};
-  await sleep(10000);
+  await sleep(5000);
   stepProgress('Incremental auth (9)');
   const inc  = (preauthUuid4||preauthUuid) ? await post('/api/till/incremental/'+(preauthUuid4||preauthUuid), {amount:'0.25',currency:'AUD'}) : {success:false,raw:{error:'No preauth uuid (complete HPP on 2.h)'}};  
 
