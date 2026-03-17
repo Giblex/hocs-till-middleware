@@ -2355,13 +2355,17 @@ async function markShopifyOrderPaid(shopifyOrderId, tillUuid, txnId, amount) {
 // ENDPOINT: GET /pay/:shopifyOrderId
 // ═════════════════════════════════════════════════════════════════════════════
 // Payment portal page — customers land here from the checkout extension.
-// Looks up the Till redirect URL and immediately sends them to the payment page.
-// If the transaction isn't ready yet, shows a brief loading screen that polls.
+// If a Till redirect URL already exists, immediately 302-redirects to it.
+// If NOT (webhook hasn't fired yet), this route fetches the order from
+// Shopify Admin API and initiates the Till debit itself, then redirects.
+//
+// This eliminates the race condition where the customer arrives before the
+// webhook has been processed.
 //
 // Query params:
 //   ?email=customer@example.com   (required — must match order email)
 
-app.get('/pay/:shopifyOrderId', (req, res) => {
+app.get('/pay/:shopifyOrderId', async (req, res) => {
   const shopifyOrderId = req.params.shopifyOrderId.trim();
   const email = (req.query.email || '').trim().toLowerCase();
 
@@ -2373,9 +2377,9 @@ app.get('/pay/:shopifyOrderId', (req, res) => {
     ));
   }
 
-  const txn = getTransactionByShopifyOrderId(shopifyOrderId);
+  logger.info('Pay portal accessed', { shopifyOrderId, hasEmail: !!email });
 
-  logger.info('Pay portal accessed', { shopifyOrderId, hasEmail: !!email, found: !!txn });
+  let txn = getTransactionByShopifyOrderId(shopifyOrderId);
 
   // ── Already paid ──
   if (txn && txn.status === 'paid') {
@@ -2394,21 +2398,180 @@ app.get('/pay/:shopifyOrderId', (req, res) => {
 
   // ── Redirect URL ready — send them straight to Till ──
   if (txn && txn.status === 'initiated' && txn.redirectUrl) {
-    logger.info('Pay portal redirecting to Till HPP', { shopifyOrderId, txnId: txn.txnId });
+    logger.info('Pay portal redirecting to Till HPP (existing)', { shopifyOrderId, txnId: txn.txnId });
     return res.redirect(302, txn.redirectUrl);
   }
 
-  // ── Not ready yet — show a brief loading page that auto-polls ──
-  const pollUrl = `/api/payment-redirect-by-shopify-id/${encodeURIComponent(shopifyOrderId)}?email=${encodeURIComponent(email)}`;
-  return res.status(200).send(payPortalHTML(
-    'Preparing Your Payment',
-    `<p>We&rsquo;re connecting you to our secure payment gateway.<br>This usually takes just a few seconds.</p>
-     <div class="spinner"></div>
-     <p class="small">If you are not redirected automatically, <a href="${STORE_URL}/pages/complete-payment?shopifyId=${encodeURIComponent(shopifyOrderId)}&email=${encodeURIComponent(email)}">click here</a>.</p>`,
-    true,
-    pollUrl,
-    `/pay/${encodeURIComponent(shopifyOrderId)}?email=${encodeURIComponent(email)}`
-  ));
+  // ═══════════════════════════════════════════════════════════════════════
+  // No transaction yet (webhook hasn't fired). Initiate payment directly.
+  // ═══════════════════════════════════════════════════════════════════════
+  try {
+    logger.info('Pay portal — no transaction found, initiating payment directly', { shopifyOrderId });
+
+    // ── Fetch order from Shopify Admin API ──
+    const orderRes = await shopifyAdminAPI('GET', `/orders/${shopifyOrderId}.json`);
+    if (!orderRes.body || !orderRes.body.order) {
+      logger.error('Pay portal — failed to fetch order from Shopify', { shopifyOrderId, status: orderRes.status });
+      return res.status(404).send(payPortalHTML(
+        'Order Not Found',
+        '<p>We could not locate this order. Please contact us for assistance.</p>',
+        false
+      ));
+    }
+
+    const order = orderRes.body.order;
+
+    // ── Verify email matches the order ──
+    const orderEmail = (order.email || '').trim().toLowerCase();
+    if (orderEmail && email !== orderEmail) {
+      logger.warn('Pay portal email mismatch (from Shopify)', { shopifyOrderId, provided: email, orderEmail });
+      return res.status(403).send(payPortalHTML(
+        'Access Denied',
+        '<p>The email address does not match this order.</p>',
+        false
+      ));
+    }
+
+    // ── Skip if order is already paid in Shopify ──
+    if (order.financial_status === 'paid' || order.financial_status === 'partially_paid') {
+      logger.info('Pay portal — order already paid in Shopify', { shopifyOrderId, financialStatus: order.financial_status });
+      return res.redirect(302, SUCCESS_URL);
+    }
+
+    const orderId     = order.id;
+    const orderNumber = order.order_number || order.name;
+    const totalPrice  = order.total_price;
+    const currency    = order.currency || 'AUD';
+    const txnId       = `HOC-${orderNumber}`;
+
+    // ── Idempotency: check if transaction was created between our first check and now ──
+    const existingTxn = getTransaction(txnId);
+    if (existingTxn && existingTxn.status === 'initiated' && existingTxn.redirectUrl) {
+      logger.info('Pay portal — transaction appeared (race resolved)', { shopifyOrderId, txnId });
+      return res.redirect(302, existingTxn.redirectUrl);
+    }
+    if (existingTxn && existingTxn.status === 'paid') {
+      return res.redirect(302, SUCCESS_URL);
+    }
+
+    // ── Build customer data from Shopify order ──
+    const billing  = order.billing_address || {};
+    const customer = order.customer || {};
+    const ip       = order.browser_ip || order.client_details?.browser_ip || req.ip || '0.0.0.0';
+
+    const tillCustomer = {
+      firstName:       billing.first_name || customer.first_name || '',
+      lastName:        billing.last_name  || customer.last_name  || '',
+      email:           order.email || customer.email || '',
+      ipAddress:       ip,
+      billingAddress1: billing.address1 || '',
+      billingAddress2: billing.address2 || '',
+      billingCity:     billing.city || '',
+      billingState:    billing.province_code || '',
+      billingPostcode: billing.zip || '',
+      billingCountry:  billing.country_code || 'AU',
+      billingPhone:    billing.phone || customer.phone || ''
+    };
+
+    // ── Build debit request with 3DS MANDATORY ──
+    const debitPayload = {
+      merchantTransactionId: txnId,
+      amount:      totalPrice,
+      currency:    currency,
+      successUrl:  SUCCESS_URL,
+      cancelUrl:   CANCEL_URL,
+      errorUrl:    ERROR_URL,
+      callbackUrl: CALLBACK_URL,
+      description: `High on Chapel Order #${orderNumber}`,
+      customer:    tillCustomer,
+      language:    'en',
+      transactionIndicator: 'SINGLE',
+      extraData: { '3dsecure': 'MANDATORY' },
+      threeDSecureData: {
+        '3dsecure':                      'MANDATORY',
+        channel:                         '02',
+        authenticationIndicator:         '01',
+        cardholderAuthenticationMethod:  '01',
+        challengeIndicator:              '02'
+      }
+    };
+
+    // ── Save pending transaction ──
+    saveTransaction({
+      txnId,
+      status: 'pending',
+      shopifyOrderId: String(orderId),
+      orderNumber: String(orderNumber),
+      amount: totalPrice,
+      currency,
+      customerEmail: tillCustomer.email
+    });
+
+    // ── Call Till Debit API ──
+    const tillRes = await callTillAPI(
+      'POST',
+      `/api/v3/transaction/${TILL_API_KEY}/debit`,
+      debitPayload
+    );
+
+    if (tillRes.body && tillRes.body.success) {
+      const tillUuid    = tillRes.body.uuid;
+      const purchaseId  = tillRes.body.purchaseId;
+      const redirectUrl = tillRes.body.redirectUrl;
+
+      logger.info('Pay portal — Till debit initiated directly', {
+        shopifyOrderId, txnId, tillUuid,
+        hasRedirectUrl: !!redirectUrl
+      });
+
+      saveTransaction({
+        txnId,
+        status: 'initiated',
+        tillUuid,
+        purchaseId,
+        redirectUrl
+      });
+
+      if (redirectUrl) {
+        return res.redirect(302, redirectUrl);
+      }
+
+      // Till returned success but no redirect URL (unusual)
+      return res.status(200).send(payPortalHTML(
+        'Payment Processing',
+        '<p>Your payment is being set up. Please wait a moment.</p><div class="spinner"></div>',
+        true,
+        `/api/payment-redirect-by-shopify-id/${encodeURIComponent(shopifyOrderId)}?email=${encodeURIComponent(email)}`,
+        `/pay/${encodeURIComponent(shopifyOrderId)}?email=${encodeURIComponent(email)}`
+      ));
+    }
+
+    // ── Till returned an error ──
+    const tillError = tillRes.body?.errors?.[0] || {};
+    logger.error('Pay portal — Till debit failed', { shopifyOrderId, txnId, tillError });
+
+    saveTransaction({
+      txnId,
+      status: 'failed',
+      tillError: tillRes.rawBody?.substring(0, 500)
+    });
+
+    return res.status(502).send(payPortalHTML(
+      'Payment Unavailable',
+      '<p>We could not connect to the payment gateway. Please try again in a moment or contact us for assistance.</p>'
+        + `<p><a href="/pay/${encodeURIComponent(shopifyOrderId)}?email=${encodeURIComponent(email)}">Try Again</a></p>`,
+      false
+    ));
+
+  } catch (err) {
+    logger.error('Pay portal — unexpected error', { shopifyOrderId, error: err.message, stack: err.stack });
+    return res.status(500).send(payPortalHTML(
+      'Something Went Wrong',
+      '<p>An unexpected error occurred. Please try again or contact us.</p>'
+        + `<p><a href="/pay/${encodeURIComponent(shopifyOrderId)}?email=${encodeURIComponent(email)}">Try Again</a></p>`,
+      false
+    ));
+  }
 });
 
 /**
