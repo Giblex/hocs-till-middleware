@@ -2351,6 +2351,143 @@ async function markShopifyOrderPaid(shopifyOrderId, tillUuid, txnId, amount) {
   }
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// ENDPOINT: GET /pay/:shopifyOrderId
+// ═════════════════════════════════════════════════════════════════════════════
+// Payment portal page — customers land here from the checkout extension.
+// Looks up the Till redirect URL and immediately sends them to the payment page.
+// If the transaction isn't ready yet, shows a brief loading screen that polls.
+//
+// Query params:
+//   ?email=customer@example.com   (required — must match order email)
+
+app.get('/pay/:shopifyOrderId', (req, res) => {
+  const shopifyOrderId = req.params.shopifyOrderId.trim();
+  const email = (req.query.email || '').trim().toLowerCase();
+
+  if (!shopifyOrderId || !email) {
+    return res.status(400).send(payPortalHTML(
+      'Missing Information',
+      '<p>Order details are missing. Please return to your order confirmation email and try again.</p>',
+      false
+    ));
+  }
+
+  const txn = getTransactionByShopifyOrderId(shopifyOrderId);
+
+  logger.info('Pay portal accessed', { shopifyOrderId, hasEmail: !!email, found: !!txn });
+
+  // ── Already paid ──
+  if (txn && txn.status === 'paid') {
+    return res.redirect(302, SUCCESS_URL);
+  }
+
+  // ── Email mismatch ──
+  if (txn && txn.customerEmail && email !== txn.customerEmail.trim().toLowerCase()) {
+    logger.warn('Pay portal email mismatch', { shopifyOrderId, provided: email });
+    return res.status(403).send(payPortalHTML(
+      'Access Denied',
+      '<p>The email address does not match this order. Please use the link from your order confirmation.</p>',
+      false
+    ));
+  }
+
+  // ── Redirect URL ready — send them straight to Till ──
+  if (txn && txn.status === 'initiated' && txn.redirectUrl) {
+    logger.info('Pay portal redirecting to Till HPP', { shopifyOrderId, txnId: txn.txnId });
+    return res.redirect(302, txn.redirectUrl);
+  }
+
+  // ── Not ready yet — show a brief loading page that auto-polls ──
+  const pollUrl = `/api/payment-redirect-by-shopify-id/${encodeURIComponent(shopifyOrderId)}?email=${encodeURIComponent(email)}`;
+  return res.status(200).send(payPortalHTML(
+    'Preparing Your Payment',
+    `<p>We&rsquo;re connecting you to our secure payment gateway.<br>This usually takes just a few seconds.</p>
+     <div class="spinner"></div>
+     <p class="small">If you are not redirected automatically, <a href="${STORE_URL}/pages/complete-payment?shopifyId=${encodeURIComponent(shopifyOrderId)}&email=${encodeURIComponent(email)}">click here</a>.</p>`,
+    true,
+    pollUrl,
+    `/pay/${encodeURIComponent(shopifyOrderId)}?email=${encodeURIComponent(email)}`
+  ));
+});
+
+/**
+ * Generates the payment portal HTML page.
+ * Kept inline to avoid extra dependencies — just a branded loading/redirect page.
+ */
+function payPortalHTML(title, bodyContent, showPoll, pollUrl, reloadUrl) {
+  const pollScript = showPoll ? `
+    <script>
+      (function() {
+        var attempts = 0, max = 30;
+        function poll() {
+          if (++attempts > max) {
+            document.getElementById('msg').innerHTML =
+              '<p>Taking longer than expected. <a href="${reloadUrl}">Tap here to retry</a>.</p>';
+            return;
+          }
+          fetch('${pollUrl}', { headers: { Accept: 'application/json' } })
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+              if (d.status === 'ready' && d.redirectUrl) {
+                window.location.replace(d.redirectUrl);
+              } else if (d.status === 'paid') {
+                window.location.replace('${SUCCESS_URL}');
+              } else {
+                setTimeout(poll, 2000);
+              }
+            })
+            .catch(function() { setTimeout(poll, 3000); });
+        }
+        setTimeout(poll, 1500);
+      })();
+    </script>` : '';
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>${title} — High on Chapel</title>
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+      background:#0a0a0a;color:#fff;display:flex;align-items:center;justify-content:center;
+      min-height:100vh;text-align:center;padding:1.5rem}
+    .card{max-width:480px;width:100%;background:#1a1a1a;border-radius:16px;padding:2.5rem 2rem;
+      box-shadow:0 8px 32px rgba(0,0,0,.5)}
+    .logo{font-size:1.6rem;font-weight:700;letter-spacing:.04em;margin-bottom:.25rem;
+      background:linear-gradient(135deg,#c9a96e,#f5d998);-webkit-background-clip:text;
+      -webkit-text-fill-color:transparent}
+    .subtitle{font-size:.8rem;color:#888;margin-bottom:2rem;text-transform:uppercase;letter-spacing:.1em}
+    h1{font-size:1.4rem;margin-bottom:1rem;color:#f0f0f0}
+    p{color:#bbb;line-height:1.6;margin-bottom:1rem;font-size:.95rem}
+    .small{font-size:.8rem;color:#666}
+    a{color:#c9a96e;text-decoration:underline}
+    .spinner{width:36px;height:36px;border:3px solid #333;border-top:3px solid #c9a96e;
+      border-radius:50%;animation:spin .8s linear infinite;margin:1.5rem auto}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    .lock{font-size:.75rem;color:#555;margin-top:2rem;display:flex;align-items:center;
+      justify-content:center;gap:.4rem}
+    .lock svg{width:14px;height:14px;fill:#555}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">HIGH ON CHAPEL</div>
+    <div class="subtitle">Secure Payments</div>
+    <h1>${title}</h1>
+    <div id="msg">${bodyContent}</div>
+    <div class="lock">
+      <svg viewBox="0 0 24 24"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1s3.1 1.39 3.1 3.1v2z"/></svg>
+      Secured by Till Payments &middot; 256-bit SSL
+    </div>
+  </div>
+  ${pollScript}
+</body>
+</html>`;
+}
+
 // ─── Start Server ───────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
