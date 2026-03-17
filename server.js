@@ -2408,14 +2408,45 @@ app.get('/pay/:shopifyOrderId', async (req, res) => {
   try {
     logger.info('Pay portal — no transaction found, initiating payment directly', { shopifyOrderId });
 
-    // ── Fetch order from Shopify Admin API ──
-    const orderRes = await shopifyAdminAPI('GET', `/orders/${shopifyOrderId}.json`);
+    // ── Fetch order from Shopify Admin API (retry once after 3s if first attempt fails) ──
+    let orderRes = await shopifyAdminAPI('GET', `/orders/${shopifyOrderId}.json`);
+
+    if ((!orderRes.body || !orderRes.body.order) && orderRes.status !== 401) {
+      // Order may not be fully committed yet — wait and retry once
+      logger.info('Pay portal — order not found on first attempt, retrying in 3s', {
+        shopifyOrderId, status: orderRes.status, responseBody: JSON.stringify(orderRes.body).substring(0, 300)
+      });
+      await new Promise(r => setTimeout(r, 3000));
+
+      // Check if webhook processed it while we waited
+      const txnRetry = getTransactionByShopifyOrderId(shopifyOrderId);
+      if (txnRetry && txnRetry.status === 'initiated' && txnRetry.redirectUrl) {
+        logger.info('Pay portal — webhook arrived during retry wait', { shopifyOrderId, txnId: txnRetry.txnId });
+        return res.redirect(302, txnRetry.redirectUrl);
+      }
+      if (txnRetry && txnRetry.status === 'paid') {
+        return res.redirect(302, SUCCESS_URL);
+      }
+
+      orderRes = await shopifyAdminAPI('GET', `/orders/${shopifyOrderId}.json`);
+    }
+
     if (!orderRes.body || !orderRes.body.order) {
-      logger.error('Pay portal — failed to fetch order from Shopify', { shopifyOrderId, status: orderRes.status });
-      return res.status(404).send(payPortalHTML(
-        'Order Not Found',
-        '<p>We could not locate this order. Please contact us for assistance.</p>',
-        false
+      logger.error('Pay portal — failed to fetch order from Shopify after retry', {
+        shopifyOrderId, status: orderRes.status,
+        responseBody: JSON.stringify(orderRes.body).substring(0, 500)
+      });
+
+      // Fall back to polling page — the webhook will eventually fire
+      const pollUrl = `/api/payment-redirect-by-shopify-id/${encodeURIComponent(shopifyOrderId)}?email=${encodeURIComponent(email)}`;
+      return res.status(200).send(payPortalHTML(
+        'Preparing Your Payment',
+        `<p>We&rsquo;re connecting you to our secure payment gateway.<br>This usually takes just a few seconds.</p>
+         <div class="spinner"></div>
+         <p class="small">If you are not redirected automatically, <a href="/pay/${encodeURIComponent(shopifyOrderId)}?email=${encodeURIComponent(email)}">click here to retry</a>.</p>`,
+        true,
+        pollUrl,
+        `/pay/${encodeURIComponent(shopifyOrderId)}?email=${encodeURIComponent(email)}`
       ));
     }
 
