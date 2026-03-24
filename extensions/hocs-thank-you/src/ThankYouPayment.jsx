@@ -1,14 +1,10 @@
 /**
  * HOCS Payment Redirect — Checkout UI Extension
- * ──────────────────────────────────────────────
- * Renders on the Shopify Thank You page after checkout.
- * Directs unpaid orders straight to the middleware payment portal,
- * which auto-redirects to the Till HPP for card entry.
- *
- * Flow: Thank You → click → Middleware Portal → Till HPP → Pay → Success
+ * Renders on Thank You + Order Status pages.
+ * Directs unpaid orders to the middleware payment portal → Till HPP.
  */
 
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import {
   reactExtension,
   Banner,
@@ -21,28 +17,30 @@ import {
 
 const MIDDLEWARE_URL = 'https://hocs-till-middleware-production.up.railway.app';
 
+// ── Thank You page target ──
 export default reactExtension('purchase.thank-you.block.render', () => (
+  <PaymentRedirectBanner />
+));
+
+// ── Order Status page target ──
+export const orderStatus = reactExtension('customer-account.order-status.block.render', () => (
   <PaymentRedirectBanner />
 ));
 
 function PaymentRedirectBanner() {
   const order = useOrder();
   const email = useEmail();
-
   const [redirecting, setRedirecting] = useState(false);
 
-  // Extract numeric Shopify order ID from GID
-  // e.g. "gid://shopify/OrderIdentity/5085102137" → "5085102137"
   const shopifyOrderId = order?.id ? order.id.split('/').pop() : '';
   const customerEmail = email || '';
 
-  // Link directly to the middleware payment portal — no intermediary Shopify page
-  const payPortalUrl = `${MIDDLEWARE_URL}/pay/${encodeURIComponent(shopifyOrderId)}`
-    + `?email=${encodeURIComponent(customerEmail)}`;
+  // Build pay portal URL — works even without email (middleware handles it)
+  const payPortalUrl = shopifyOrderId
+    ? `${MIDDLEWARE_URL}/pay/${encodeURIComponent(shopifyOrderId)}?email=${encodeURIComponent(customerEmail)}`
+    : '';
 
-  // ── Don't render if we don't have order/email data ──
-  if (!shopifyOrderId || !customerEmail) return null;
-
+  // Always render the banner so it's visible (even in customizer preview)
   return (
     <Banner status="critical" title="⚠️ Payment Required — Your order is NOT yet paid">
       <BlockStack spacing="base">
@@ -52,13 +50,17 @@ function PaymentRedirectBanner() {
         <Text>
           Click the button below to enter your card details on our secure payment page.
         </Text>
-        <Button
-          kind="primary"
-          to={payPortalUrl}
-          onPress={() => setRedirecting(true)}
-        >
-          {redirecting ? 'Opening payment page…' : '💳 Complete Payment Now'}
-        </Button>
+        {shopifyOrderId ? (
+          <Button
+            kind="primary"
+            to={payPortalUrl}
+            onPress={() => setRedirecting(true)}
+          >
+            {redirecting ? 'Opening payment page…' : '💳 Complete Payment Now'}
+          </Button>
+        ) : (
+          <Text emphasis="bold">Loading payment details…</Text>
+        )}
         <Text size="small" appearance="subdued">
           Secured by Till Payments · 256-bit SSL encrypted
         </Text>

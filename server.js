@@ -584,6 +584,8 @@ const stmts = {
   getTxn:        db.prepare('SELECT * FROM transactions WHERE txn_id = ?'),
   getTxnByOrder: db.prepare('SELECT * FROM transactions WHERE order_number = ?'),
   getTxnByShopifyId: db.prepare('SELECT * FROM transactions WHERE shopify_order_id = ?'),
+  getTxnByTillUuid:  db.prepare('SELECT * FROM transactions WHERE till_uuid = ?'),
+  getTxnByPurchaseId: db.prepare('SELECT * FROM transactions WHERE purchase_id = ?'),
   upsertTxn:     db.prepare(`
     INSERT INTO transactions (txn_id, status, shopify_order_id, order_number, amount, currency, till_uuid, purchase_id, redirect_url, till_error, customer_email, updated_at)
     VALUES (@txn_id, @status, @shopify_order_id, @order_number, @amount, @currency, @till_uuid, @purchase_id, @redirect_url, @till_error, @customer_email, datetime('now'))
@@ -678,6 +680,75 @@ function saveTransaction(data) {
     till_error:       data.tillError       || null,
     customer_email:   data.customerEmail   || null
   });
+}
+
+// Helper: look up transaction by Till UUID (callback resolution)
+function getTransactionByTillUuid(tillUuid) {
+  const row = stmts.getTxnByTillUuid.get(String(tillUuid));
+  if (!row) return null;
+  return {
+    txnId:          row.txn_id,
+    status:         row.status,
+    shopifyOrderId: row.shopify_order_id,
+    orderNumber:    row.order_number,
+    amount:         row.amount,
+    currency:       row.currency,
+    tillUuid:       row.till_uuid,
+    purchaseId:     row.purchase_id,
+    redirectUrl:    row.redirect_url,
+    tillError:      row.till_error,
+    customerEmail:  row.customer_email,
+    createdAt:      row.created_at,
+    updatedAt:      row.updated_at
+  };
+}
+
+// Helper: look up transaction by purchase ID (callback resolution)
+function getTransactionByPurchaseId(purchaseId) {
+  const row = stmts.getTxnByPurchaseId.get(String(purchaseId));
+  if (!row) return null;
+  return {
+    txnId:          row.txn_id,
+    status:         row.status,
+    shopifyOrderId: row.shopify_order_id,
+    orderNumber:    row.order_number,
+    amount:         row.amount,
+    currency:       row.currency,
+    tillUuid:       row.till_uuid,
+    purchaseId:     row.purchase_id,
+    redirectUrl:    row.redirect_url,
+    tillError:      row.till_error,
+    customerEmail:  row.customer_email,
+    createdAt:      row.created_at,
+    updatedAt:      row.updated_at
+  };
+}
+
+// Cascading transaction lookup — tries all known identifiers from a Till callback.
+// This is the fix for "Callback for unknown transaction" — if Till returns a
+// different or missing merchantTransactionId, we still find the record.
+function resolveTransactionFromCallback(cb) {
+  // 1. Primary: merchantTransactionId (what we sent to Till)
+  if (cb.merchantTransactionId) {
+    const txn = getTransaction(cb.merchantTransactionId);
+    if (txn) return { txn, matchedBy: 'merchantTransactionId' };
+  }
+
+  // 2. Till's own UUID (returned in original debit response, stored in till_uuid)
+  const tillUuid = cb.uuid || cb.referenceUuid;
+  if (tillUuid) {
+    const txn = getTransactionByTillUuid(tillUuid);
+    if (txn) return { txn, matchedBy: 'tillUuid' };
+  }
+
+  // 3. Purchase ID
+  if (cb.purchaseId) {
+    const txn = getTransactionByPurchaseId(cb.purchaseId);
+    if (txn) return { txn, matchedBy: 'purchaseId' };
+  }
+
+  // 4. Nothing matched
+  return { txn: null, matchedBy: null };
 }
 
 function hasWebhook(orderId)    { return !!stmts.hasWebhook.get(String(orderId)); }
@@ -1153,25 +1224,56 @@ app.post('/api/till-callback', async (req, res) => {
 
     // ── 2. Parse callback data ───────────────────────────────────────────
     const cb = req.body;
-    const txnId     = cb.merchantTransactionId;
-    const tillUuid  = cb.uuid || cb.referenceUuid;
-    const result    = cb.result;       // e.g. "OK", "ERROR"
-    const cbAmount  = cb.amount;       // e.g. "42.50"
-    const cbCurrency = cb.currency;    // e.g. "AUD"
-    const returnType = cb.returnType;  // e.g. "FINISHED", "REDIRECT", "ERROR"
+    const txnId      = cb.merchantTransactionId;
+    const tillUuid   = cb.uuid || cb.referenceUuid;
+    const result     = cb.result;       // e.g. "OK", "ERROR"
+    const cbAmount   = cb.amount;       // e.g. "42.50"
+    const cbCurrency = cb.currency;     // e.g. "AUD"
+    const returnType = cb.returnType;   // e.g. "FINISHED", "REDIRECT", "ERROR"
 
-    logger.info('Callback details', { requestId, txnId, tillUuid, result, returnType, cbAmount, cbCurrency });
+    // Log ALL identifiers from the callback for debugging correlation issues.
+    // This is critical — previously "Callback for unknown transaction" gave no
+    // visibility into what Till actually sent back.
+    logger.info('Callback identifiers (full)', {
+      requestId,
+      merchantTransactionId: cb.merchantTransactionId || '(missing)',
+      uuid: cb.uuid || '(missing)',
+      referenceUuid: cb.referenceUuid || '(missing)',
+      purchaseId: cb.purchaseId || '(missing)',
+      transactionType: cb.transactionType || '(missing)',
+      result,
+      returnType,
+      cbAmount,
+      cbCurrency
+    });
 
-    // ── 3. Look up original transaction for amount validation (Rec #6) ───
-    const original = getTransaction(txnId);
+    // ── 3. Cascading transaction lookup (Rec #6) ─────────────────────────
+    // Fix for "Callback for unknown transaction": if merchantTransactionId
+    // is missing or doesn't match, fall back to Till's uuid or purchaseId.
+    const { txn: original, matchedBy } = resolveTransactionFromCallback(cb);
     if (!original) {
-      logger.warn('Callback for unknown transaction — may be a replay or test', { requestId, txnId });
+      logger.warn('Callback for unknown transaction — no match on any identifier', {
+        requestId,
+        merchantTransactionId: cb.merchantTransactionId || '(missing)',
+        uuid: cb.uuid || '(missing)',
+        referenceUuid: cb.referenceUuid || '(missing)',
+        purchaseId: cb.purchaseId || '(missing)'
+      });
       return res.status(200).send('OK');
+    }
+
+    if (matchedBy !== 'merchantTransactionId') {
+      logger.warn('Callback matched by fallback identifier — merchantTransactionId may have drifted', {
+        requestId,
+        matchedBy,
+        callbackMerchantTxnId: cb.merchantTransactionId || '(missing)',
+        storedTxnId: original.txnId
+      });
     }
 
     // Prevent duplicate processing (Rec #8)
     if (original.status === 'paid') {
-      logger.info('Callback for already-paid transaction — skipping', { requestId, txnId });
+      logger.info('Callback for already-paid transaction — skipping', { requestId, txnId: original.txnId });
       return res.status(200).send('OK');
     }
 
@@ -1182,23 +1284,23 @@ app.post('/api/till-callback', async (req, res) => {
 
       if (callbackCents !== originalCents) {
         logger.alert('AMOUNT MISMATCH — callback amount differs from order!', {
-          requestId, txnId,
+          requestId, txnId: original.txnId,
           expected: original.amount,
           received: cbAmount
         });
         // Do NOT mark as paid — this is suspicious
-        saveTransaction({ txnId, status: 'amount_mismatch' });
+        saveTransaction({ txnId: original.txnId, status: 'amount_mismatch' });
         return res.status(200).send('OK');
       }
     }
 
     if (cbCurrency && original.currency && cbCurrency !== original.currency) {
       logger.alert('CURRENCY MISMATCH on callback', {
-        requestId, txnId,
+        requestId, txnId: original.txnId,
         expected: original.currency,
         received: cbCurrency
       });
-      saveTransaction({ txnId, status: 'currency_mismatch' });
+      saveTransaction({ txnId: original.txnId, status: 'currency_mismatch' });
       return res.status(200).send('OK');
     }
 
@@ -1215,7 +1317,7 @@ app.post('/api/till-callback', async (req, res) => {
     // DB during the Shopify webhook handler. There is nothing to do here.
     if (returnType === 'REDIRECT') {
       logger.info('Till REDIRECT callback received — hosted payment page ready, awaiting customer payment', {
-        requestId, txnId, tillUuid
+        requestId, txnId: original.txnId, tillUuid
       });
       // No action needed — redirectUrl already stored; customer will complete payment on Till's page.
       return res.status(200).send('OK');
@@ -1223,16 +1325,18 @@ app.post('/api/till-callback', async (req, res) => {
 
     if (result === 'OK' && returnType === 'FINISHED') {
       // Payment succeeded — mark Shopify order as paid
-      logger.info('Payment successful — marking Shopify order paid', { requestId, txnId });
+      logger.info('Payment successful — marking Shopify order paid', {
+        requestId, txnId: original.txnId, matchedBy
+      });
 
-      const markResult = await markShopifyOrderPaid(original.shopifyOrderId, tillUuid, txnId, original.amount);
+      const markResult = await markShopifyOrderPaid(original.shopifyOrderId, tillUuid, original.txnId, original.amount);
 
       if (markResult.success) {
-        saveTransaction({ txnId, status: 'paid', tillUuid });
-        logger.info('Shopify order marked as paid', { requestId, txnId, shopifyOrderId: original.shopifyOrderId });
+        saveTransaction({ txnId: original.txnId, status: 'paid', tillUuid });
+        logger.info('Shopify order marked as paid', { requestId, txnId: original.txnId, shopifyOrderId: original.shopifyOrderId });
       } else {
         logger.error('Failed to mark Shopify order as paid', {
-          requestId, txnId,
+          requestId, txnId: original.txnId,
           shopifyOrderId: original.shopifyOrderId,
           error: markResult.error
         });
@@ -1240,33 +1344,33 @@ app.post('/api/till-callback', async (req, res) => {
       }
 
     } else if (result === 'ERROR') {
-      saveTransaction({ txnId, status: 'failed', tillUuid });
+      saveTransaction({ txnId: original.txnId, status: 'failed', tillUuid });
       const errorCode = cb.errors?.[0]?.errorCode;
       const errorMsg  = cb.errors?.[0]?.errorMessage || cb.errors?.[0]?.message || 'unknown';
       const adapterCode = cb.errors?.[0]?.adapterCode || '';
       const adapterMsg  = cb.errors?.[0]?.adapterMessage || '';
 
       logger.error('PAYMENT FAILED DETAILS', {
-        requestId, txnId, tillUuid,
+        requestId, txnId: original.txnId, tillUuid,
         errorCode, errorMsg, adapterCode, adapterMsg,
         fullErrors: JSON.stringify(cb.errors),
         fullBody: JSON.stringify(cb).substring(0, 1000)
       });
 
       if (errorCode === 1004) {
-        logger.alert('Till payment error 1004 — check connector/config', { requestId, txnId, errorMsg, adapterMsg });
+        logger.alert('Till payment error 1004 — check connector/config', { requestId, txnId: original.txnId, errorMsg, adapterMsg });
       } else if (errorCode === 2003) {
-        logger.alert('Till payment declined (2003)', { requestId, txnId, errorMsg, adapterMsg });
+        logger.alert('Till payment declined (2003)', { requestId, txnId: original.txnId, errorMsg, adapterMsg });
       } else if (errorCode === 2021) {
-        logger.alert('Till 3DS verification failed (2021)', { requestId, txnId, errorMsg, adapterMsg });
+        logger.alert('Till 3DS verification failed (2021)', { requestId, txnId: original.txnId, errorMsg, adapterMsg });
       } else if (errorCode === 3004) {
-        logger.alert('Till duplicate transaction ID (3004)', { requestId, txnId, errorMsg, adapterMsg });
+        logger.alert('Till duplicate transaction ID (3004)', { requestId, txnId: original.txnId, errorMsg, adapterMsg });
       } else {
-        logger.error('Payment failed — unhandled error code', { requestId, txnId, errorCode, errorMsg, adapterCode, adapterMsg });
+        logger.error('Payment failed — unhandled error code', { requestId, txnId: original.txnId, errorCode, errorMsg, adapterCode, adapterMsg });
       }
 
     } else {
-      logger.warn('Unhandled callback result', { requestId, txnId, result, returnType });
+      logger.warn('Unhandled callback result', { requestId, txnId: original.txnId, result, returnType });
     }
 
     // ── 6. Always respond HTTP 200 + "OK" (per Till spec) ────────────────
@@ -1277,6 +1381,593 @@ app.post('/api/till-callback', async (req, res) => {
     // Still return 200 to prevent infinite retries
     return res.status(200).send('OK');
   }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ENDPOINT: POST /api/reconcile/:orderNumber
+// ═════════════════════════════════════════════════════════════════════════════
+// Manual payment reconciliation — checks Till for a transaction's real status
+// and updates Shopify if it was actually paid but the callback was lost.
+// Requires API key auth to prevent abuse.
+//
+// Headers:
+//   X-Api-Key: <TILL_SHARED_SECRET>
+//
+// This recovers orders like #1443 where the bank charged the customer
+// but the callback couldn't be matched.
+
+app.post('/api/reconcile/:orderNumber', async (req, res) => {
+  const requestId = crypto.randomUUID();
+
+  // Simple API key auth — use the shared secret
+  const apiKey = req.get('X-Api-Key');
+  if (!apiKey || apiKey !== TILL_SHARED_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const orderNumber = req.params.orderNumber.replace(/^#/, '');
+  const txnId = `HOC-${orderNumber}`;
+  logger.info('Manual reconciliation requested', { requestId, orderNumber, txnId });
+
+  // Look up the transaction
+  let txn = getTransaction(txnId);
+  if (!txn) {
+    txn = getTransactionByOrderNumber(orderNumber);
+  }
+  if (!txn) {
+    return res.status(404).json({ error: 'Transaction not found', orderNumber, txnId });
+  }
+
+  if (txn.status === 'paid') {
+    return res.json({ status: 'already_paid', txnId: txn.txnId, orderNumber });
+  }
+
+  // If we have a Till UUID, query Till for the real status
+  if (txn.tillUuid) {
+    try {
+      const tillRes = await callTillAPI(
+        'GET',
+        `/api/v3/status/${TILL_API_KEY}/${txn.tillUuid}`
+      );
+
+      const tillStatus = tillRes.body;
+      logger.info('Till status check result', {
+        requestId, txnId: txn.txnId,
+        tillStatus: tillStatus?.status || tillStatus?.transactionStatus,
+        result: tillStatus?.result,
+        returnType: tillStatus?.returnType
+      });
+
+      // If Till says it was successful, mark Shopify as paid
+      if (tillStatus && (tillStatus.result === 'OK' || tillStatus.status === 'SUCCESS')) {
+        const markResult = await markShopifyOrderPaid(
+          txn.shopifyOrderId, txn.tillUuid, txn.txnId, txn.amount
+        );
+
+        if (markResult.success) {
+          saveTransaction({ txnId: txn.txnId, status: 'paid', tillUuid: txn.tillUuid });
+          logger.info('Manual reconciliation — order marked as paid', {
+            requestId, txnId: txn.txnId, orderNumber
+          });
+          return res.json({
+            status: 'reconciled',
+            txnId: txn.txnId,
+            orderNumber,
+            message: 'Order has been marked as paid in Shopify'
+          });
+        } else {
+          logger.error('Manual reconciliation — failed to mark Shopify order paid', {
+            requestId, txnId: txn.txnId, error: markResult.error
+          });
+          return res.status(502).json({
+            error: 'Till confirms payment but Shopify update failed',
+            details: markResult.error
+          });
+        }
+      }
+
+      return res.json({
+        status: 'not_paid_at_till',
+        txnId: txn.txnId,
+        currentStatus: txn.status,
+        tillResponse: tillStatus
+      });
+
+    } catch (err) {
+      logger.error('Manual reconciliation — Till status check failed', {
+        requestId, txnId: txn.txnId, error: err.message
+      });
+      return res.status(502).json({ error: 'Failed to check Till status', details: err.message });
+    }
+  }
+
+  // No Till UUID — can't check status
+  return res.json({
+    status: 'no_till_uuid',
+    txnId: txn.txnId,
+    currentStatus: txn.status,
+    message: 'Transaction has no Till UUID — cannot verify payment status remotely'
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ENDPOINT: GET /api/transactions/:orderNumber
+// ═════════════════════════════════════════════════════════════════════════════
+// Debug endpoint — returns transaction state. Requires API key auth.
+
+app.get('/api/transactions/:orderNumber', (req, res) => {
+  const apiKey = req.get('X-Api-Key');
+  if (!apiKey || apiKey !== TILL_SHARED_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const orderNumber = req.params.orderNumber.replace(/^#/, '');
+  const txnId = `HOC-${orderNumber}`;
+  let txn = getTransaction(txnId);
+  if (!txn) {
+    txn = getTransactionByOrderNumber(orderNumber);
+  }
+  if (!txn) {
+    return res.status(404).json({ error: 'Transaction not found' });
+  }
+
+  return res.json(txn);
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ENDPOINT: POST /api/cancel/:orderNumber
+// ═════════════════════════════════════════════════════════════════════════════
+// Cancel a pending payment:
+//   1. Void/refund the Till transaction (releases the bank hold)
+//   2. Cancel the Shopify order
+//   3. Update local transaction status to 'cancelled'
+//
+// Requires API key auth. Use this when a customer's bank shows a pending
+// authorisation but the order needs to be abandoned.
+//
+// Headers:
+//   X-Api-Key: <TILL_SHARED_SECRET>
+// Body (optional):
+//   { "reason": "Customer requested cancellation" }
+
+app.post('/api/cancel/:orderNumber', async (req, res) => {
+  const requestId = crypto.randomUUID();
+
+  const apiKey = req.get('X-Api-Key');
+  if (!apiKey || apiKey !== TILL_SHARED_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const orderNumber = req.params.orderNumber.replace(/^#/, '');
+  const reason = req.body?.reason || 'Payment cancelled via admin';
+  const txnId = `HOC-${orderNumber}`;
+  logger.info('Cancel payment requested', { requestId, orderNumber, txnId });
+
+  // Look up the transaction
+  let txn = getTransaction(txnId);
+  if (!txn) {
+    txn = getTransactionByOrderNumber(orderNumber);
+  }
+  if (!txn) {
+    return res.status(404).json({ error: 'Transaction not found', orderNumber, txnId });
+  }
+
+  if (txn.status === 'cancelled') {
+    return res.json({ status: 'already_cancelled', txnId: txn.txnId, orderNumber });
+  }
+
+  const results = { tillVoid: null, shopifyCancel: null };
+
+  // ── Step 1: Void/refund at Till (releases the bank hold) ──────────────
+  if (txn.tillUuid) {
+    try {
+      // For a debit, Till uses "void" to release un-captured funds.
+      // If the debit was already captured/settled, "void" will fail —
+      // in that case we fall back to a full refund.
+      const voidPayload = {
+        merchantTransactionId: `HOC-CANCEL-${orderNumber}-${Date.now()}`,
+        referenceUuid: txn.tillUuid
+      };
+
+      let tillRes = await callTillAPI(
+        'POST',
+        `/api/v3/transaction/${TILL_API_KEY}/void`,
+        voidPayload
+      );
+
+      if (tillRes.body?.success) {
+        results.tillVoid = { success: true, method: 'void', uuid: tillRes.body.uuid };
+        logger.info('Till void succeeded', { requestId, txnId: txn.txnId, voidUuid: tillRes.body.uuid });
+      } else {
+        // Void failed — try refund instead (for settled transactions)
+        logger.info('Till void failed, attempting refund', {
+          requestId, txnId: txn.txnId,
+          voidError: tillRes.body?.errors?.[0]?.errorMessage || 'unknown'
+        });
+
+        const refundPayload = {
+          merchantTransactionId: `HOC-REFUND-${orderNumber}-${Date.now()}`,
+          referenceUuid: txn.tillUuid,
+          amount: txn.amount,
+          currency: txn.currency || 'AUD',
+          description: reason
+        };
+
+        tillRes = await callTillAPI(
+          'POST',
+          `/api/v3/transaction/${TILL_API_KEY}/refund`,
+          refundPayload
+        );
+
+        if (tillRes.body?.success) {
+          results.tillVoid = { success: true, method: 'refund', uuid: tillRes.body.uuid };
+          logger.info('Till refund succeeded', { requestId, txnId: txn.txnId, refundUuid: tillRes.body.uuid });
+        } else {
+          results.tillVoid = {
+            success: false,
+            error: tillRes.body?.errors?.[0]?.errorMessage || 'Void and refund both failed',
+            tillResponse: tillRes.body
+          };
+          logger.error('Till void and refund both failed', {
+            requestId, txnId: txn.txnId,
+            errors: JSON.stringify(tillRes.body?.errors)
+          });
+        }
+      }
+    } catch (err) {
+      results.tillVoid = { success: false, error: err.message };
+      logger.error('Till cancel API error', { requestId, txnId: txn.txnId, error: err.message });
+    }
+  } else {
+    results.tillVoid = { skipped: true, reason: 'No Till UUID — transaction may not have reached Till' };
+    logger.info('No Till UUID to void', { requestId, txnId: txn.txnId });
+  }
+
+  // ── Step 2: Cancel the Shopify order ──────────────────────────────────
+  if (txn.shopifyOrderId) {
+    try {
+      const cancelRes = await shopifyAdminAPI(
+        'POST',
+        `/orders/${txn.shopifyOrderId}/cancel.json`,
+        { reason: 'other', email: true }
+      );
+
+      if (cancelRes.status >= 200 && cancelRes.status < 300) {
+        results.shopifyCancel = { success: true };
+        logger.info('Shopify order cancelled', { requestId, txnId: txn.txnId, shopifyOrderId: txn.shopifyOrderId });
+      } else {
+        // 422 often means "already cancelled" or "already fulfilled"
+        const errorDetail = JSON.stringify(cancelRes.body).substring(0, 500);
+        results.shopifyCancel = { success: false, status: cancelRes.status, error: errorDetail };
+        logger.warn('Shopify cancel returned non-success', {
+          requestId, txnId: txn.txnId, status: cancelRes.status, body: errorDetail
+        });
+      }
+    } catch (err) {
+      results.shopifyCancel = { success: false, error: err.message };
+      logger.error('Shopify cancel API error', { requestId, txnId: txn.txnId, error: err.message });
+    }
+  } else {
+    results.shopifyCancel = { skipped: true, reason: 'No Shopify order ID' };
+  }
+
+  // ── Step 3: Update local transaction status ───────────────────────────
+  saveTransaction({ txnId: txn.txnId, status: 'cancelled' });
+
+  logger.info('Cancel payment completed', { requestId, txnId: txn.txnId, results });
+
+  return res.json({
+    status: 'cancelled',
+    txnId: txn.txnId,
+    orderNumber,
+    tillVoid: results.tillVoid,
+    shopifyCancel: results.shopifyCancel,
+    message: 'Payment cancelled. Bank hold will release within 3-5 business days.'
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ENDPOINT: POST /api/cancel/:orderNumber
+// ═════════════════════════════════════════════════════════════════════════════
+// Cancel a pending payment:
+//   1. Void/refund the Till transaction (releases the bank hold)
+//   2. Cancel the Shopify order
+//   3. Update local transaction status to 'cancelled'
+//
+// Requires API key auth. Use this when a customer's bank shows a pending
+// authorisation but the order needs to be abandoned.
+//
+// Headers:
+//   X-Api-Key: <TILL_SHARED_SECRET>
+// Body (optional):
+//   { "reason": "Customer requested cancellation" }
+
+app.post('/api/cancel/:orderNumber', async (req, res) => {
+  const requestId = crypto.randomUUID();
+
+  const apiKey = req.get('X-Api-Key');
+  if (!apiKey || apiKey !== TILL_SHARED_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const orderNumber = req.params.orderNumber.replace(/^#/, '');
+  const reason = req.body?.reason || 'Payment cancelled via admin';
+  const txnId = `HOC-${orderNumber}`;
+  logger.info('Cancel payment requested', { requestId, orderNumber, txnId });
+
+  // Look up the transaction
+  let txn = getTransaction(txnId);
+  if (!txn) {
+    txn = getTransactionByOrderNumber(orderNumber);
+  }
+  if (!txn) {
+    return res.status(404).json({ error: 'Transaction not found', orderNumber, txnId });
+  }
+
+  if (txn.status === 'cancelled') {
+    return res.json({ status: 'already_cancelled', txnId: txn.txnId, orderNumber });
+  }
+
+  const results = { tillVoid: null, shopifyCancel: null };
+
+  // ── Step 1: Void/refund at Till (releases the bank hold) ──────────────
+  if (txn.tillUuid) {
+    try {
+      // For a debit, Till uses "void" to release un-captured funds.
+      // If the debit was already captured/settled, "void" will fail —
+      // in that case we fall back to a full refund.
+      const voidPayload = {
+        merchantTransactionId: `HOC-CANCEL-${orderNumber}-${Date.now()}`,
+        referenceUuid: txn.tillUuid
+      };
+
+      let tillRes = await callTillAPI(
+        'POST',
+        `/api/v3/transaction/${TILL_API_KEY}/void`,
+        voidPayload
+      );
+
+      if (tillRes.body?.success) {
+        results.tillVoid = { success: true, method: 'void', uuid: tillRes.body.uuid };
+        logger.info('Till void succeeded', { requestId, txnId: txn.txnId, voidUuid: tillRes.body.uuid });
+      } else {
+        // Void failed — try refund instead (for settled transactions)
+        logger.info('Till void failed, attempting refund', {
+          requestId, txnId: txn.txnId,
+          voidError: tillRes.body?.errors?.[0]?.errorMessage || 'unknown'
+        });
+
+        const refundPayload = {
+          merchantTransactionId: `HOC-REFUND-${orderNumber}-${Date.now()}`,
+          referenceUuid: txn.tillUuid,
+          amount: txn.amount,
+          currency: txn.currency || 'AUD',
+          description: reason
+        };
+
+        tillRes = await callTillAPI(
+          'POST',
+          `/api/v3/transaction/${TILL_API_KEY}/refund`,
+          refundPayload
+        );
+
+        if (tillRes.body?.success) {
+          results.tillVoid = { success: true, method: 'refund', uuid: tillRes.body.uuid };
+          logger.info('Till refund succeeded', { requestId, txnId: txn.txnId, refundUuid: tillRes.body.uuid });
+        } else {
+          results.tillVoid = {
+            success: false,
+            error: tillRes.body?.errors?.[0]?.errorMessage || 'Void and refund both failed',
+            tillResponse: tillRes.body
+          };
+          logger.error('Till void and refund both failed', {
+            requestId, txnId: txn.txnId,
+            errors: JSON.stringify(tillRes.body?.errors)
+          });
+        }
+      }
+    } catch (err) {
+      results.tillVoid = { success: false, error: err.message };
+      logger.error('Till cancel API error', { requestId, txnId: txn.txnId, error: err.message });
+    }
+  } else {
+    results.tillVoid = { skipped: true, reason: 'No Till UUID — transaction may not have reached Till' };
+    logger.info('No Till UUID to void', { requestId, txnId: txn.txnId });
+  }
+
+  // ── Step 2: Cancel the Shopify order ──────────────────────────────────
+  if (txn.shopifyOrderId) {
+    try {
+      const cancelRes = await shopifyAdminAPI(
+        'POST',
+        `/orders/${txn.shopifyOrderId}/cancel.json`,
+        { reason: 'other', email: true }
+      );
+
+      if (cancelRes.status >= 200 && cancelRes.status < 300) {
+        results.shopifyCancel = { success: true };
+        logger.info('Shopify order cancelled', { requestId, txnId: txn.txnId, shopifyOrderId: txn.shopifyOrderId });
+      } else {
+        // 422 often means "already cancelled" or "already fulfilled"
+        const errorDetail = JSON.stringify(cancelRes.body).substring(0, 500);
+        results.shopifyCancel = { success: false, status: cancelRes.status, error: errorDetail };
+        logger.warn('Shopify cancel returned non-success', {
+          requestId, txnId: txn.txnId, status: cancelRes.status, body: errorDetail
+        });
+      }
+    } catch (err) {
+      results.shopifyCancel = { success: false, error: err.message };
+      logger.error('Shopify cancel API error', { requestId, txnId: txn.txnId, error: err.message });
+    }
+  } else {
+    results.shopifyCancel = { skipped: true, reason: 'No Shopify order ID' };
+  }
+
+  // ── Step 3: Update local transaction status ───────────────────────────
+  saveTransaction({ txnId: txn.txnId, status: 'cancelled' });
+
+  logger.info('Cancel payment completed', { requestId, txnId: txn.txnId, results });
+
+  return res.json({
+    status: 'cancelled',
+    txnId: txn.txnId,
+    orderNumber,
+    tillVoid: results.tillVoid,
+    shopifyCancel: results.shopifyCancel,
+    message: 'Payment cancelled. Bank hold will release within 3-5 business days.'
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ENDPOINT: POST /api/cancel/:orderNumber
+// ═════════════════════════════════════════════════════════════════════════════
+// Cancel a pending payment:
+//   1. Void/refund the Till transaction (releases the bank hold)
+//   2. Cancel the Shopify order
+//   3. Update local transaction status to 'cancelled'
+//
+// Requires API key auth. Use this when a customer's bank shows a pending
+// authorisation but the order needs to be abandoned.
+//
+// Headers:
+//   X-Api-Key: <TILL_SHARED_SECRET>
+// Body (optional):
+//   { "reason": "Customer requested cancellation" }
+
+app.post('/api/cancel/:orderNumber', async (req, res) => {
+  const requestId = crypto.randomUUID();
+
+  const apiKey = req.get('X-Api-Key');
+  if (!apiKey || apiKey !== TILL_SHARED_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const orderNumber = req.params.orderNumber.replace(/^#/, '');
+  const reason = req.body?.reason || 'Payment cancelled via admin';
+  const txnId = `HOC-${orderNumber}`;
+  logger.info('Cancel payment requested', { requestId, orderNumber, txnId });
+
+  // Look up the transaction
+  let txn = getTransaction(txnId);
+  if (!txn) {
+    txn = getTransactionByOrderNumber(orderNumber);
+  }
+  if (!txn) {
+    return res.status(404).json({ error: 'Transaction not found', orderNumber, txnId });
+  }
+
+  if (txn.status === 'cancelled') {
+    return res.json({ status: 'already_cancelled', txnId: txn.txnId, orderNumber });
+  }
+
+  const results = { tillVoid: null, shopifyCancel: null };
+
+  // ── Step 1: Void/refund at Till (releases the bank hold) ──────────────
+  if (txn.tillUuid) {
+    try {
+      // For a debit, Till uses "void" to release un-captured funds.
+      // If the debit was already captured/settled, "void" will fail —
+      // in that case we fall back to a full refund.
+      const voidPayload = {
+        merchantTransactionId: `HOC-CANCEL-${orderNumber}-${Date.now()}`,
+        referenceUuid: txn.tillUuid
+      };
+
+      let tillRes = await callTillAPI(
+        'POST',
+        `/api/v3/transaction/${TILL_API_KEY}/void`,
+        voidPayload
+      );
+
+      if (tillRes.body?.success) {
+        results.tillVoid = { success: true, method: 'void', uuid: tillRes.body.uuid };
+        logger.info('Till void succeeded', { requestId, txnId: txn.txnId, voidUuid: tillRes.body.uuid });
+      } else {
+        // Void failed — try refund instead (for settled transactions)
+        logger.info('Till void failed, attempting refund', {
+          requestId, txnId: txn.txnId,
+          voidError: tillRes.body?.errors?.[0]?.errorMessage || 'unknown'
+        });
+
+        const refundPayload = {
+          merchantTransactionId: `HOC-REFUND-${orderNumber}-${Date.now()}`,
+          referenceUuid: txn.tillUuid,
+          amount: txn.amount,
+          currency: txn.currency || 'AUD',
+          description: reason
+        };
+
+        tillRes = await callTillAPI(
+          'POST',
+          `/api/v3/transaction/${TILL_API_KEY}/refund`,
+          refundPayload
+        );
+
+        if (tillRes.body?.success) {
+          results.tillVoid = { success: true, method: 'refund', uuid: tillRes.body.uuid };
+          logger.info('Till refund succeeded', { requestId, txnId: txn.txnId, refundUuid: tillRes.body.uuid });
+        } else {
+          results.tillVoid = {
+            success: false,
+            error: tillRes.body?.errors?.[0]?.errorMessage || 'Void and refund both failed',
+            tillResponse: tillRes.body
+          };
+          logger.error('Till void and refund both failed', {
+            requestId, txnId: txn.txnId,
+            errors: JSON.stringify(tillRes.body?.errors)
+          });
+        }
+      }
+    } catch (err) {
+      results.tillVoid = { success: false, error: err.message };
+      logger.error('Till cancel API error', { requestId, txnId: txn.txnId, error: err.message });
+    }
+  } else {
+    results.tillVoid = { skipped: true, reason: 'No Till UUID — transaction may not have reached Till' };
+    logger.info('No Till UUID to void', { requestId, txnId: txn.txnId });
+  }
+
+  // ── Step 2: Cancel the Shopify order ──────────────────────────────────
+  if (txn.shopifyOrderId) {
+    try {
+      const cancelRes = await shopifyAdminAPI(
+        'POST',
+        `/orders/${txn.shopifyOrderId}/cancel.json`,
+        { reason: 'other', email: true }
+      );
+
+      if (cancelRes.status >= 200 && cancelRes.status < 300) {
+        results.shopifyCancel = { success: true };
+        logger.info('Shopify order cancelled', { requestId, txnId: txn.txnId, shopifyOrderId: txn.shopifyOrderId });
+      } else {
+        // 422 often means "already cancelled" or "already fulfilled"
+        const errorDetail = JSON.stringify(cancelRes.body).substring(0, 500);
+        results.shopifyCancel = { success: false, status: cancelRes.status, error: errorDetail };
+        logger.warn('Shopify cancel returned non-success', {
+          requestId, txnId: txn.txnId, status: cancelRes.status, body: errorDetail
+        });
+      }
+    } catch (err) {
+      results.shopifyCancel = { success: false, error: err.message };
+      logger.error('Shopify cancel API error', { requestId, txnId: txn.txnId, error: err.message });
+    }
+  } else {
+    results.shopifyCancel = { skipped: true, reason: 'No Shopify order ID' };
+  }
+
+  // ── Step 3: Update local transaction status ───────────────────────────
+  saveTransaction({ txnId: txn.txnId, status: 'cancelled' });
+
+  logger.info('Cancel payment completed', { requestId, txnId: txn.txnId, results });
+
+  return res.json({
+    status: 'cancelled',
+    txnId: txn.txnId,
+    orderNumber,
+    tillVoid: results.tillVoid,
+    shopifyCancel: results.shopifyCancel,
+    message: 'Payment cancelled. Bank hold will release within 3-5 business days.'
+  });
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
