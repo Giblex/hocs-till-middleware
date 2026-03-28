@@ -31,8 +31,8 @@ const crypto     = require('crypto');
 const path       = require('path');
 const fetch      = require('node-fetch');   // node-fetch@2 for CJS compatibility
 const rateLimit  = require('express-rate-limit');
-const Database   = require('better-sqlite3');
 const nodemailer = require('nodemailer');
+const { Pool }   = require('pg');
 
 // Optional: Puppeteer for HPP auto-completion (cert testing)
 let puppeteer;
@@ -65,7 +65,7 @@ const {
   CANCEL_URL            = 'https://highonchapel.com/pages/payment-cancelled',
   ERROR_URL             = 'https://highonchapel.com/pages/payment-error',
   CALLBACK_URL,                    // Must be this server's public URL + /api/till-callback
-  DB_PATH          = path.join(__dirname, 'hocs-middleware.db'),  // SQLite persistence
+  DATABASE_URL,
 
   // Email / SMTP (for sending payment link emails)
   SMTP_HOST        = '',           // e.g. smtp.gmail.com, smtp.sendgrid.net
@@ -83,7 +83,7 @@ const {
 const REQUIRED_ENV = [
   'TILL_API_KEY', 'TILL_SHARED_SECRET', 'TILL_API_USER', 'TILL_API_PASS',
   'SHOPIFY_STORE_DOMAIN', 'SHOPIFY_CLIENT_ID', 'SHOPIFY_CLIENT_SECRET',
-  'SHOPIFY_WEBHOOK_SECRET', 'CALLBACK_URL'
+  'SHOPIFY_WEBHOOK_SECRET', 'CALLBACK_URL', 'DATABASE_URL'
 ];
 
 for (const key of REQUIRED_ENV) {
@@ -545,66 +545,16 @@ async function sendPaymentEmail(customerEmail, orderNumber, redirectUrl, amount,
 }
 
 // ─── Persistent Idempotency Store (Rec #4 + #8) ────────────────────────────
-// SQLite-backed — survives server restarts. Zero external dependencies.
-// For multi-instance deployments, replace with Redis or Postgres.
+// PostgreSQL-backed — durable across Railway deploys and restarts.
 
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');           // Write-Ahead Logging for concurrent reads
-db.pragma('busy_timeout = 5000');          // Wait up to 5s if DB is locked
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: DATABASE_URL && !/localhost|127\.0\.0\.1/i.test(DATABASE_URL)
+    ? { rejectUnauthorized: false }
+    : false
+});
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS transactions (
-    txn_id            TEXT PRIMARY KEY,
-    status            TEXT NOT NULL DEFAULT 'pending',
-    shopify_order_id  TEXT,
-    order_number      TEXT,
-    amount            TEXT,
-    currency          TEXT,
-    till_uuid         TEXT,
-    purchase_id       TEXT,
-    redirect_url      TEXT,
-    till_error        TEXT,
-    customer_email    TEXT,
-    created_at        TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
-  );
-  CREATE TABLE IF NOT EXISTS webhooks (
-    order_id   TEXT PRIMARY KEY,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-  );
-`);
-
-// Migrate: add customer_email column if missing (safe to run multiple times)
-try {
-  db.exec('ALTER TABLE transactions ADD COLUMN customer_email TEXT');
-} catch (_) { /* column already exists — ignore */ }
-
-// Prepared statements for performance
-const stmts = {
-  getTxn:        db.prepare('SELECT * FROM transactions WHERE txn_id = ?'),
-  getTxnByOrder: db.prepare('SELECT * FROM transactions WHERE order_number = ?'),
-  getTxnByShopifyId: db.prepare('SELECT * FROM transactions WHERE shopify_order_id = ?'),
-  getTxnByTillUuid:  db.prepare('SELECT * FROM transactions WHERE till_uuid = ?'),
-  getTxnByPurchaseId: db.prepare('SELECT * FROM transactions WHERE purchase_id = ?'),
-  upsertTxn:     db.prepare(`
-    INSERT INTO transactions (txn_id, status, shopify_order_id, order_number, amount, currency, till_uuid, purchase_id, redirect_url, till_error, customer_email, updated_at)
-    VALUES (@txn_id, @status, @shopify_order_id, @order_number, @amount, @currency, @till_uuid, @purchase_id, @redirect_url, @till_error, @customer_email, datetime('now'))
-    ON CONFLICT(txn_id) DO UPDATE SET
-      status         = excluded.status,
-      till_uuid      = COALESCE(excluded.till_uuid, transactions.till_uuid),
-      purchase_id    = COALESCE(excluded.purchase_id, transactions.purchase_id),
-      redirect_url   = COALESCE(excluded.redirect_url, transactions.redirect_url),
-      till_error     = COALESCE(excluded.till_error, transactions.till_error),
-      customer_email = COALESCE(excluded.customer_email, transactions.customer_email),
-      updated_at     = datetime('now')
-  `),
-  hasWebhook:    db.prepare('SELECT 1 FROM webhooks WHERE order_id = ?'),
-  insertWebhook: db.prepare('INSERT OR IGNORE INTO webhooks (order_id) VALUES (?)')
-};
-
-// Helper: read a transaction row as a plain object (or null)
-function getTransaction(txnId) {
-  const row = stmts.getTxn.get(txnId);
+function mapTransactionRow(row) {
   if (!row) return null;
   return {
     txnId:          row.txn_id,
@@ -623,140 +573,149 @@ function getTransaction(txnId) {
   };
 }
 
-// Helper: look up transaction by Shopify order_number (for redirect page)
-function getTransactionByOrderNumber(orderNumber) {
-  const row = stmts.getTxnByOrder.get(String(orderNumber));
-  if (!row) return null;
-  return {
-    txnId:          row.txn_id,
-    status:         row.status,
-    shopifyOrderId: row.shopify_order_id,
-    orderNumber:    row.order_number,
-    amount:         row.amount,
-    currency:       row.currency,
-    tillUuid:       row.till_uuid,
-    purchaseId:     row.purchase_id,
-    redirectUrl:    row.redirect_url,
-    tillError:      row.till_error,
-    customerEmail:  row.customer_email,
-    createdAt:      row.created_at,
-    updatedAt:      row.updated_at
-  };
+async function initDatabase() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS transactions (
+      txn_id           TEXT PRIMARY KEY,
+      status           TEXT NOT NULL DEFAULT 'pending',
+      shopify_order_id TEXT,
+      order_number     TEXT,
+      amount           TEXT,
+      currency         TEXT,
+      till_uuid        TEXT,
+      purchase_id      TEXT,
+      redirect_url     TEXT,
+      till_error       TEXT,
+      customer_email   TEXT,
+      created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS webhooks (
+      order_id   TEXT PRIMARY KEY,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_transactions_order_number ON transactions(order_number);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_transactions_shopify_order_id ON transactions(shopify_order_id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_transactions_till_uuid ON transactions(till_uuid);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_transactions_purchase_id ON transactions(purchase_id);`);
 }
 
-// Helper: look up transaction by Shopify order ID (for checkout extension)
-function getTransactionByShopifyOrderId(shopifyOrderId) {
-  const row = stmts.getTxnByShopifyId.get(String(shopifyOrderId));
-  if (!row) return null;
-  return {
-    txnId:          row.txn_id,
-    status:         row.status,
-    shopifyOrderId: row.shopify_order_id,
-    orderNumber:    row.order_number,
-    amount:         row.amount,
-    currency:       row.currency,
-    tillUuid:       row.till_uuid,
-    purchaseId:     row.purchase_id,
-    redirectUrl:    row.redirect_url,
-    tillError:      row.till_error,
-    customerEmail:  row.customer_email,
-    createdAt:      row.created_at,
-    updatedAt:      row.updated_at
-  };
+async function getTransaction(txnId) {
+  const { rows } = await pool.query('SELECT * FROM transactions WHERE txn_id = $1 LIMIT 1', [String(txnId)]);
+  return mapTransactionRow(rows[0]);
 }
 
-// Helper: upsert a transaction
-function saveTransaction(data) {
-  stmts.upsertTxn.run({
-    txn_id:           data.txnId           || null,
-    status:           data.status          || 'pending',
-    shopify_order_id: data.shopifyOrderId  || null,
-    order_number:     data.orderNumber     || null,
-    amount:           data.amount          || null,
-    currency:         data.currency        || null,
-    till_uuid:        data.tillUuid        || null,
-    purchase_id:      data.purchaseId      || null,
-    redirect_url:     data.redirectUrl     || null,
-    till_error:       data.tillError       || null,
-    customer_email:   data.customerEmail   || null
-  });
+async function getTransactionByOrderNumber(orderNumber) {
+  const { rows } = await pool.query('SELECT * FROM transactions WHERE order_number = $1 LIMIT 1', [String(orderNumber)]);
+  return mapTransactionRow(rows[0]);
 }
 
-// Helper: look up transaction by Till UUID (callback resolution)
-function getTransactionByTillUuid(tillUuid) {
-  const row = stmts.getTxnByTillUuid.get(String(tillUuid));
-  if (!row) return null;
-  return {
-    txnId:          row.txn_id,
-    status:         row.status,
-    shopifyOrderId: row.shopify_order_id,
-    orderNumber:    row.order_number,
-    amount:         row.amount,
-    currency:       row.currency,
-    tillUuid:       row.till_uuid,
-    purchaseId:     row.purchase_id,
-    redirectUrl:    row.redirect_url,
-    tillError:      row.till_error,
-    customerEmail:  row.customer_email,
-    createdAt:      row.created_at,
-    updatedAt:      row.updated_at
-  };
+async function getTransactionByShopifyOrderId(shopifyOrderId) {
+  const { rows } = await pool.query('SELECT * FROM transactions WHERE shopify_order_id = $1 LIMIT 1', [String(shopifyOrderId)]);
+  return mapTransactionRow(rows[0]);
 }
 
-// Helper: look up transaction by purchase ID (callback resolution)
-function getTransactionByPurchaseId(purchaseId) {
-  const row = stmts.getTxnByPurchaseId.get(String(purchaseId));
-  if (!row) return null;
-  return {
-    txnId:          row.txn_id,
-    status:         row.status,
-    shopifyOrderId: row.shopify_order_id,
-    orderNumber:    row.order_number,
-    amount:         row.amount,
-    currency:       row.currency,
-    tillUuid:       row.till_uuid,
-    purchaseId:     row.purchase_id,
-    redirectUrl:    row.redirect_url,
-    tillError:      row.till_error,
-    customerEmail:  row.customer_email,
-    createdAt:      row.created_at,
-    updatedAt:      row.updated_at
-  };
+async function saveTransaction(data) {
+  await pool.query(`
+    INSERT INTO transactions (
+      txn_id, status, shopify_order_id, order_number, amount, currency,
+      till_uuid, purchase_id, redirect_url, till_error, customer_email, updated_at
+    )
+    VALUES (
+      $1, $2, $3, $4, $5, $6,
+      $7, $8, $9, $10, $11, NOW()
+    )
+    ON CONFLICT (txn_id) DO UPDATE SET
+      status = EXCLUDED.status,
+      shopify_order_id = COALESCE(EXCLUDED.shopify_order_id, transactions.shopify_order_id),
+      order_number = COALESCE(EXCLUDED.order_number, transactions.order_number),
+      amount = COALESCE(EXCLUDED.amount, transactions.amount),
+      currency = COALESCE(EXCLUDED.currency, transactions.currency),
+      till_uuid = COALESCE(EXCLUDED.till_uuid, transactions.till_uuid),
+      purchase_id = COALESCE(EXCLUDED.purchase_id, transactions.purchase_id),
+      redirect_url = COALESCE(EXCLUDED.redirect_url, transactions.redirect_url),
+      till_error = COALESCE(EXCLUDED.till_error, transactions.till_error),
+      customer_email = COALESCE(EXCLUDED.customer_email, transactions.customer_email),
+      updated_at = NOW()
+  `, [
+    data.txnId || null,
+    data.status || 'pending',
+    data.shopifyOrderId || null,
+    data.orderNumber || null,
+    data.amount || null,
+    data.currency || null,
+    data.tillUuid || null,
+    data.purchaseId || null,
+    data.redirectUrl || null,
+    data.tillError || null,
+    data.customerEmail || null
+  ]);
 }
 
-// Cascading transaction lookup — tries all known identifiers from a Till callback.
-// This is the fix for "Callback for unknown transaction" — if Till returns a
-// different or missing merchantTransactionId, we still find the record.
-function resolveTransactionFromCallback(cb) {
-  // 1. Primary: merchantTransactionId (what we sent to Till)
+async function getTransactionByTillUuid(tillUuid) {
+  const { rows } = await pool.query('SELECT * FROM transactions WHERE till_uuid = $1 LIMIT 1', [String(tillUuid)]);
+  return mapTransactionRow(rows[0]);
+}
+
+async function getTransactionByPurchaseId(purchaseId) {
+  const { rows } = await pool.query('SELECT * FROM transactions WHERE purchase_id = $1 LIMIT 1', [String(purchaseId)]);
+  return mapTransactionRow(rows[0]);
+}
+
+async function resolveTransactionFromCallback(cb) {
   if (cb.merchantTransactionId) {
-    const txn = getTransaction(cb.merchantTransactionId);
+    const txn = await getTransaction(cb.merchantTransactionId);
     if (txn) return { txn, matchedBy: 'merchantTransactionId' };
   }
 
-  // 2. Till's own UUID (returned in original debit response, stored in till_uuid)
   const tillUuid = cb.uuid || cb.referenceUuid;
   if (tillUuid) {
-    const txn = getTransactionByTillUuid(tillUuid);
+    const txn = await getTransactionByTillUuid(tillUuid);
     if (txn) return { txn, matchedBy: 'tillUuid' };
   }
 
-  // 3. Purchase ID
   if (cb.purchaseId) {
-    const txn = getTransactionByPurchaseId(cb.purchaseId);
+    const txn = await getTransactionByPurchaseId(cb.purchaseId);
     if (txn) return { txn, matchedBy: 'purchaseId' };
   }
 
-  // 4. Nothing matched
   return { txn: null, matchedBy: null };
 }
 
-function hasWebhook(orderId)    { return !!stmts.hasWebhook.get(String(orderId)); }
-function markWebhook(orderId)   { stmts.insertWebhook.run(String(orderId)); }
+async function hasWebhook(orderId) {
+  const { rowCount } = await pool.query('SELECT 1 FROM webhooks WHERE order_id = $1 LIMIT 1', [String(orderId)]);
+  return rowCount > 0;
+}
 
-// Graceful shutdown — close DB
-process.on('SIGINT',  () => { db.close(); process.exit(0); });
-process.on('SIGTERM', () => { db.close(); process.exit(0); });
+async function markWebhook(orderId) {
+  await pool.query(
+    'INSERT INTO webhooks (order_id, created_at) VALUES ($1, NOW()) ON CONFLICT (order_id) DO NOTHING',
+    [String(orderId)]
+  );
+}
+
+function normalizeTillValue(value) {
+  return typeof value === 'string' ? value.trim().toUpperCase() : '';
+}
+
+function getTillErrorDetails(payload) {
+  const firstError = payload?.errors?.[0] || {};
+  return {
+    errorCode: firstError.errorCode ?? payload?.errorCode ?? null,
+    errorMessage: firstError.errorMessage || firstError.message || payload?.errorMessage || payload?.message || 'unknown',
+    adapterCode: firstError.adapterCode || payload?.adapterCode || '',
+    adapterMessage: firstError.adapterMessage || payload?.adapterMessage || ''
+  };
+}
+
+// Graceful shutdown — close Postgres pool
+process.on('SIGINT', async () => { await pool.end().catch(() => {}); process.exit(0); });
+process.on('SIGTERM', async () => { await pool.end().catch(() => {}); process.exit(0); });
 
 // ─── Express App ────────────────────────────────────────────────────────────
 
@@ -816,6 +775,21 @@ app.use('/api/payment-redirect-by-shopify-id', (req, res, next) => {
   next();
 });
 
+// ── CORS for Payment Success page ───────────────────────────────────────────
+// /pages/payment-success calls /api/payment-confirm from the browser after
+// Till redirects the customer back, to confirm and trigger backend payment.
+app.use('/api/payment-confirm', (req, res, next) => {
+  const origin = req.get('Origin');
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.set('Access-Control-Allow-Origin', origin);
+    res.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type');
+    res.set('Access-Control-Max-Age', '86400');
+  }
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 // ── Health check ────────────────────────────────────────────────────────────
 
 app.get('/health', (_req, res) => {
@@ -845,7 +819,7 @@ app.get('/health', (_req, res) => {
 //   200 { status: "failed",    error: "..." }                — payment initiation failed
 //   200 { status: "not_found" }                              — order not found or email mismatch
 
-app.get('/api/payment-redirect/:orderNumber', (req, res) => {
+app.get('/api/payment-redirect/:orderNumber', async (req, res) => {
   const orderNumber = req.params.orderNumber.replace(/^#/, '');
   const email       = (req.query.email || '').trim().toLowerCase();
 
@@ -855,9 +829,9 @@ app.get('/api/payment-redirect/:orderNumber', (req, res) => {
 
   // Look up by txn_id (HOC-<orderNumber>) first, fall back to order_number column
   const txnId = `HOC-${orderNumber}`;
-  let txn = getTransaction(txnId);
+  let txn = await getTransaction(txnId);
   if (!txn) {
-    txn = getTransactionByOrderNumber(orderNumber);
+    txn = await getTransactionByOrderNumber(orderNumber);
   }
 
   logger.info('Payment redirect lookup', { orderNumber, txnId, hasEmail: !!email, found: !!txn });
@@ -913,17 +887,13 @@ app.get('/api/payment-redirect/:orderNumber', (req, res) => {
 // Used by the checkout extension which only has access to the Shopify GID.
 //
 // Query params:
-//   ?email=customer@example.com   (required — must match order email)
+//   ?email=customer@example.com   (optional — when present, must match order email)
 
-app.get('/api/payment-redirect-by-shopify-id/:shopifyOrderId', (req, res) => {
+app.get('/api/payment-redirect-by-shopify-id/:shopifyOrderId', async (req, res) => {
   const shopifyOrderId = req.params.shopifyOrderId.trim();
   const email = (req.query.email || '').trim().toLowerCase();
 
-  if (!email) {
-    return res.json({ status: 'not_found' });
-  }
-
-  const txn = getTransactionByShopifyOrderId(shopifyOrderId);
+  const txn = await getTransactionByShopifyOrderId(shopifyOrderId);
 
   logger.info('Payment redirect by Shopify ID lookup', { shopifyOrderId, hasEmail: !!email, found: !!txn });
 
@@ -932,7 +902,7 @@ app.get('/api/payment-redirect-by-shopify-id/:shopifyOrderId', (req, res) => {
   }
 
   // Email verification
-  if (txn.customerEmail && email !== txn.customerEmail.trim().toLowerCase()) {
+  if (email && txn.customerEmail && email !== txn.customerEmail.trim().toLowerCase()) {
     logger.warn('Payment redirect email mismatch (by Shopify ID)', { shopifyOrderId, provided: email });
     return res.json({ status: 'not_found' });
   }
@@ -955,6 +925,92 @@ app.get('/api/payment-redirect-by-shopify-id/:shopifyOrderId', (req, res) => {
     case 'currency_mismatch':
       return res.json({ status: 'failed', error: txn.tillError || txn.status });
 
+    default:
+      return res.json({ status: 'pending' });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ENDPOINT: GET /api/payment-confirm
+// ═════════════════════════════════════════════════════════════════════════════
+// Called by /pages/payment-success immediately after Till redirects the
+// customer back. Till appends merchantTransactionId (= our txnId) as a query
+// param. This endpoint:
+//   1. Validates the txnId exists in our DB.
+//   2. Fast-path: if already marked paid (Till callback already fired) → return.
+//   3. If not yet paid and we have a Till UUID, queries Till's status API
+//      server-side. If Till confirms success, calls markShopifyOrderPaid()
+//      and updates the DB — handles the case where the async callback is late.
+//   4. Returns { status, orderNumber } — no API key, rate-limited by IP.
+//
+// Query params:
+//   ?txnId=HOC-1234   (the merchantTransactionId Till appended to SUCCESS_URL)
+//
+// Responses:
+//   200 { status: 'paid',      orderNumber: '1234' }
+//   200 { status: 'pending' }
+//   200 { status: 'failed',    error: '...' }
+//   200 { status: 'not_found' }
+app.get('/api/payment-confirm', paymentLimiter, async (req, res) => {
+  const txnId = (req.query.txnId || '').trim();
+
+  // Validate format — must be HOC- followed by word chars / hyphens
+  if (!txnId || !/^HOC-[\w-]+$/.test(txnId)) {
+    return res.json({ status: 'not_found' });
+  }
+
+  const txn = await getTransaction(txnId).catch(() => null);
+  if (!txn) {
+    return res.json({ status: 'not_found' });
+  }
+
+  // Fast-path: already confirmed paid (Till callback fired before page loaded)
+  if (txn.status === 'paid') {
+    return res.json({ status: 'paid', orderNumber: txn.orderNumber });
+  }
+
+  // If we have a Till UUID, query Till server-side for the real status.
+  // This handles the case where the async callback has not yet arrived.
+  if (txn.tillUuid) {
+    try {
+      const tillRes = await callTillAPI(
+        'GET',
+        `/api/v3/status/${TILL_API_KEY}/${txn.tillUuid}`
+      );
+      const tillStatus = tillRes.body;
+
+      logger.info('payment-confirm: Till status check', {
+        txnId: txn.txnId,
+        result: tillStatus?.result,
+        status: tillStatus?.status
+      });
+
+      if (tillStatus && (tillStatus.result === 'OK' || tillStatus.status === 'SUCCESS')) {
+        const markResult = await markShopifyOrderPaid(
+          txn.shopifyOrderId, txn.tillUuid, txn.txnId, txn.amount
+        );
+
+        if (markResult.success) {
+          await saveTransaction({ txnId: txn.txnId, status: 'paid', tillUuid: txn.tillUuid });
+          logger.info('payment-confirm: order marked paid via proactive status check', { txnId: txn.txnId });
+          return res.json({ status: 'paid', orderNumber: txn.orderNumber });
+        }
+
+        logger.error('payment-confirm: markShopifyOrderPaid failed', {
+          txnId: txn.txnId,
+          error: markResult.error
+        });
+      }
+    } catch (err) {
+      logger.error('payment-confirm: Till status check threw', { txnId: txn.txnId, error: err.message });
+    }
+  }
+
+  switch (txn.status) {
+    case 'failed':
+    case 'amount_mismatch':
+    case 'currency_mismatch':
+      return res.json({ status: 'failed', error: txn.tillError || txn.status });
     default:
       return res.json({ status: 'pending' });
   }
@@ -1032,13 +1088,13 @@ app.post('/api/shopify-webhook', paymentLimiter, async (req, res) => {
 
     // ── 3. Idempotency: skip if already processed (Rec #8) ───────────────
     const txnId = `HOC-${orderNumber}`;  // Deterministic, idempotent ID (Rec #4)
-    if (hasWebhook(orderId)) {
+    if (await hasWebhook(orderId)) {
       logger.info('Duplicate webhook — skipping', { requestId, orderId });
       return res.status(200).json({ status: 'already_processed' });
     }
-    markWebhook(orderId);
+    await markWebhook(orderId);
 
-    if (getTransaction(txnId)) {
+    if (await getTransaction(txnId)) {
       logger.info('Transaction already initiated — skipping', { requestId, txnId });
       return res.status(200).json({ status: 'already_initiated', txnId });
     }
@@ -1090,7 +1146,7 @@ app.post('/api/shopify-webhook', paymentLimiter, async (req, res) => {
     };
 
     // Store transaction intent before calling Till
-    saveTransaction({
+    await saveTransaction({
       txnId,
       status: 'pending',
       shopifyOrderId: String(orderId),
@@ -1121,7 +1177,7 @@ app.post('/api/shopify-webhook', paymentLimiter, async (req, res) => {
         successUrl: SUCCESS_URL,
       });
 
-      saveTransaction({
+      await saveTransaction({
         txnId,
         status: 'initiated',
         tillUuid,
@@ -1150,11 +1206,15 @@ app.post('/api/shopify-webhook', paymentLimiter, async (req, res) => {
     }
 
     // Till returned an error
-    const tillError = tillRes.body?.errors?.[0] || {};
-    saveTransaction({
+    const tillError = getTillErrorDetails(tillRes.body);
+    const isDuplicateTxn = String(tillError.errorCode) === '3004';
+
+    await saveTransaction({
       txnId,
-      status: 'failed',
-      tillError: tillRes.rawBody?.substring(0, 500)
+      status: isDuplicateTxn ? 'pending' : 'failed',
+      tillError: isDuplicateTxn
+        ? 'duplicate_transaction_in_progress'
+        : tillRes.rawBody?.substring(0, 500)
     });
 
     // Alert on specific error codes (Rec #9)
@@ -1169,6 +1229,11 @@ app.post('/api/shopify-webhook', paymentLimiter, async (req, res) => {
       logger.alert('Till error 2021 — 3DS verification failed', { requestId, txnId, error: tillError });
     } else if (ec === 3004) {
       logger.alert('Till error 3004 — duplicate transaction ID', { requestId, txnId, error: tillError });
+      return res.status(200).json({
+        status: 'duplicate_in_progress',
+        txnId,
+        message: 'Till already has a payment session for this order'
+      });
     } else {
       logger.error('Till debit failed', { requestId, txnId, tillStatus: tillRes.status, error: tillError });
     }
@@ -1230,6 +1295,11 @@ app.post('/api/till-callback', async (req, res) => {
     const cbAmount   = cb.amount;       // e.g. "42.50"
     const cbCurrency = cb.currency;     // e.g. "AUD"
     const returnType = cb.returnType;   // e.g. "FINISHED", "REDIRECT", "ERROR"
+    const cbStatus   = cb.status || cb.transactionStatus || '';
+    const normalizedResult = normalizeTillValue(result);
+    const normalizedReturnType = normalizeTillValue(returnType);
+    const normalizedStatus = normalizeTillValue(cbStatus);
+    const hasCallbackErrors = Array.isArray(cb.errors) && cb.errors.length > 0;
 
     // Log ALL identifiers from the callback for debugging correlation issues.
     // This is critical — previously "Callback for unknown transaction" gave no
@@ -1243,6 +1313,7 @@ app.post('/api/till-callback', async (req, res) => {
       transactionType: cb.transactionType || '(missing)',
       result,
       returnType,
+      status: cbStatus || '(missing)',
       cbAmount,
       cbCurrency
     });
@@ -1250,7 +1321,7 @@ app.post('/api/till-callback', async (req, res) => {
     // ── 3. Cascading transaction lookup (Rec #6) ─────────────────────────
     // Fix for "Callback for unknown transaction": if merchantTransactionId
     // is missing or doesn't match, fall back to Till's uuid or purchaseId.
-    const { txn: original, matchedBy } = resolveTransactionFromCallback(cb);
+    const { txn: original, matchedBy } = await resolveTransactionFromCallback(cb);
     if (!original) {
       logger.warn('Callback for unknown transaction — no match on any identifier', {
         requestId,
@@ -1289,7 +1360,7 @@ app.post('/api/till-callback', async (req, res) => {
           received: cbAmount
         });
         // Do NOT mark as paid — this is suspicious
-        saveTransaction({ txnId: original.txnId, status: 'amount_mismatch' });
+        await saveTransaction({ txnId: original.txnId, status: 'amount_mismatch' });
         return res.status(200).send('OK');
       }
     }
@@ -1300,7 +1371,7 @@ app.post('/api/till-callback', async (req, res) => {
         expected: original.currency,
         received: cbCurrency
       });
-      saveTransaction({ txnId: original.txnId, status: 'currency_mismatch' });
+      await saveTransaction({ txnId: original.txnId, status: 'currency_mismatch' });
       return res.status(200).send('OK');
     }
 
@@ -1315,7 +1386,7 @@ app.post('/api/till-callback', async (req, res) => {
     // Till sends a REDIRECT callback when the debit is initiated and a hosted
     // payment page URL is generated. The redirect URL is already saved to the
     // DB during the Shopify webhook handler. There is nothing to do here.
-    if (returnType === 'REDIRECT') {
+    if (normalizedReturnType === 'REDIRECT' || normalizedStatus === 'REDIRECT') {
       logger.info('Till REDIRECT callback received — hosted payment page ready, awaiting customer payment', {
         requestId, txnId: original.txnId, tillUuid
       });
@@ -1323,7 +1394,26 @@ app.post('/api/till-callback', async (req, res) => {
       return res.status(200).send('OK');
     }
 
-    if (result === 'OK' && returnType === 'FINISHED') {
+    const isExplicitSuccess =
+      normalizedResult === 'OK' &&
+      (normalizedReturnType === 'FINISHED' || normalizedStatus === 'SUCCESS');
+
+    const isImplicitSuccess =
+      normalizedResult === 'OK' &&
+      !normalizedReturnType &&
+      !normalizedStatus &&
+      !hasCallbackErrors;
+
+    if (isImplicitSuccess) {
+      logger.warn('Till callback missing returnType/status — treating signed result=OK callback as successful payment', {
+        requestId,
+        txnId: original.txnId,
+        tillUuid,
+        matchedBy
+      });
+    }
+
+    if (isExplicitSuccess || isImplicitSuccess) {
       // Payment succeeded — mark Shopify order as paid
       logger.info('Payment successful — marking Shopify order paid', {
         requestId, txnId: original.txnId, matchedBy
@@ -1332,7 +1422,7 @@ app.post('/api/till-callback', async (req, res) => {
       const markResult = await markShopifyOrderPaid(original.shopifyOrderId, tillUuid, original.txnId, original.amount);
 
       if (markResult.success) {
-        saveTransaction({ txnId: original.txnId, status: 'paid', tillUuid });
+        await saveTransaction({ txnId: original.txnId, status: 'paid', tillUuid });
         logger.info('Shopify order marked as paid', { requestId, txnId: original.txnId, shopifyOrderId: original.shopifyOrderId });
       } else {
         logger.error('Failed to mark Shopify order as paid', {
@@ -1343,8 +1433,8 @@ app.post('/api/till-callback', async (req, res) => {
         // Don't update status — retry will catch it
       }
 
-    } else if (result === 'ERROR') {
-      saveTransaction({ txnId: original.txnId, status: 'failed', tillUuid });
+    } else if (normalizedResult === 'ERROR' || normalizedReturnType === 'ERROR' || normalizedStatus === 'ERROR' || hasCallbackErrors) {
+      await saveTransaction({ txnId: original.txnId, status: 'failed', tillUuid });
       const errorCode = cb.errors?.[0]?.errorCode;
       const errorMsg  = cb.errors?.[0]?.errorMessage || cb.errors?.[0]?.message || 'unknown';
       const adapterCode = cb.errors?.[0]?.adapterCode || '';
@@ -1370,7 +1460,14 @@ app.post('/api/till-callback', async (req, res) => {
       }
 
     } else {
-      logger.warn('Unhandled callback result', { requestId, txnId: original.txnId, result, returnType });
+      logger.warn('Unhandled callback result', {
+        requestId,
+        txnId: original.txnId,
+        result,
+        returnType,
+        status: cbStatus || '(missing)',
+        fullBody: JSON.stringify(cb).substring(0, 1000)
+      });
     }
 
     // ── 6. Always respond HTTP 200 + "OK" (per Till spec) ────────────────
@@ -1410,9 +1507,9 @@ app.post('/api/reconcile/:orderNumber', async (req, res) => {
   logger.info('Manual reconciliation requested', { requestId, orderNumber, txnId });
 
   // Look up the transaction
-  let txn = getTransaction(txnId);
+  let txn = await getTransaction(txnId);
   if (!txn) {
-    txn = getTransactionByOrderNumber(orderNumber);
+    txn = await getTransactionByOrderNumber(orderNumber);
   }
   if (!txn) {
     return res.status(404).json({ error: 'Transaction not found', orderNumber, txnId });
@@ -1445,7 +1542,7 @@ app.post('/api/reconcile/:orderNumber', async (req, res) => {
         );
 
         if (markResult.success) {
-          saveTransaction({ txnId: txn.txnId, status: 'paid', tillUuid: txn.tillUuid });
+          await saveTransaction({ txnId: txn.txnId, status: 'paid', tillUuid: txn.tillUuid });
           logger.info('Manual reconciliation — order marked as paid', {
             requestId, txnId: txn.txnId, orderNumber
           });
@@ -1495,7 +1592,7 @@ app.post('/api/reconcile/:orderNumber', async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 // Debug endpoint — returns transaction state. Requires API key auth.
 
-app.get('/api/transactions/:orderNumber', (req, res) => {
+app.get('/api/transactions/:orderNumber', async (req, res) => {
   const apiKey = req.get('X-Api-Key');
   if (!apiKey || apiKey !== TILL_SHARED_SECRET) {
     return res.status(401).json({ error: 'Unauthorized' });
@@ -1503,9 +1600,9 @@ app.get('/api/transactions/:orderNumber', (req, res) => {
 
   const orderNumber = req.params.orderNumber.replace(/^#/, '');
   const txnId = `HOC-${orderNumber}`;
-  let txn = getTransaction(txnId);
+  let txn = await getTransaction(txnId);
   if (!txn) {
-    txn = getTransactionByOrderNumber(orderNumber);
+    txn = await getTransactionByOrderNumber(orderNumber);
   }
   if (!txn) {
     return res.status(404).json({ error: 'Transaction not found' });
@@ -1544,9 +1641,9 @@ app.post('/api/cancel/:orderNumber', async (req, res) => {
   logger.info('Cancel payment requested', { requestId, orderNumber, txnId });
 
   // Look up the transaction
-  let txn = getTransaction(txnId);
+  let txn = await getTransaction(txnId);
   if (!txn) {
-    txn = getTransactionByOrderNumber(orderNumber);
+    txn = await getTransactionByOrderNumber(orderNumber);
   }
   if (!txn) {
     return res.status(404).json({ error: 'Transaction not found', orderNumber, txnId });
@@ -1652,7 +1749,7 @@ app.post('/api/cancel/:orderNumber', async (req, res) => {
   }
 
   // ── Step 3: Update local transaction status ───────────────────────────
-  saveTransaction({ txnId: txn.txnId, status: 'cancelled' });
+  await saveTransaction({ txnId: txn.txnId, status: 'cancelled' });
 
   logger.info('Cancel payment completed', { requestId, txnId: txn.txnId, results });
 
@@ -1696,9 +1793,9 @@ app.post('/api/cancel/:orderNumber', async (req, res) => {
   logger.info('Cancel payment requested', { requestId, orderNumber, txnId });
 
   // Look up the transaction
-  let txn = getTransaction(txnId);
+  let txn = await getTransaction(txnId);
   if (!txn) {
-    txn = getTransactionByOrderNumber(orderNumber);
+    txn = await getTransactionByOrderNumber(orderNumber);
   }
   if (!txn) {
     return res.status(404).json({ error: 'Transaction not found', orderNumber, txnId });
@@ -1804,7 +1901,7 @@ app.post('/api/cancel/:orderNumber', async (req, res) => {
   }
 
   // ── Step 3: Update local transaction status ───────────────────────────
-  saveTransaction({ txnId: txn.txnId, status: 'cancelled' });
+  await saveTransaction({ txnId: txn.txnId, status: 'cancelled' });
 
   logger.info('Cancel payment completed', { requestId, txnId: txn.txnId, results });
 
@@ -1848,9 +1945,9 @@ app.post('/api/cancel/:orderNumber', async (req, res) => {
   logger.info('Cancel payment requested', { requestId, orderNumber, txnId });
 
   // Look up the transaction
-  let txn = getTransaction(txnId);
+  let txn = await getTransaction(txnId);
   if (!txn) {
-    txn = getTransactionByOrderNumber(orderNumber);
+    txn = await getTransactionByOrderNumber(orderNumber);
   }
   if (!txn) {
     return res.status(404).json({ error: 'Transaction not found', orderNumber, txnId });
@@ -1956,7 +2053,7 @@ app.post('/api/cancel/:orderNumber', async (req, res) => {
   }
 
   // ── Step 3: Update local transaction status ───────────────────────────
-  saveTransaction({ txnId: txn.txnId, status: 'cancelled' });
+  await saveTransaction({ txnId: txn.txnId, status: 'cancelled' });
 
   logger.info('Cancel payment completed', { requestId, txnId: txn.txnId, results });
 
@@ -3042,6 +3139,21 @@ async function markShopifyOrderPaid(shopifyOrderId, tillUuid, txnId, amount) {
   }
 }
 
+function renderPayPortalRecovery(res, shopifyOrderId, email) {
+  const pollUrl = `/api/payment-redirect-by-shopify-id/${encodeURIComponent(shopifyOrderId)}?email=${encodeURIComponent(email)}`;
+  const retryUrl = `/pay/${encodeURIComponent(shopifyOrderId)}?email=${encodeURIComponent(email)}`;
+  return res.status(200).send(payPortalHTML(
+    'Finishing Your Payment',
+    `<p>Your secure payment session has already been created and may still be processing.</p>
+     <p>Please wait here while we reconnect you or confirm the payment result.</p>
+     <div class="spinner"></div>
+     <p class="small">If you already completed the payment in another tab or window, this page will update automatically.</p>`,
+    true,
+    pollUrl,
+    retryUrl
+  ));
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // ENDPOINT: GET /pay/:shopifyOrderId
 // ═════════════════════════════════════════════════════════════════════════════
@@ -3060,7 +3172,7 @@ app.get('/pay/:shopifyOrderId', async (req, res) => {
   const shopifyOrderId = req.params.shopifyOrderId.trim();
   const email = (req.query.email || '').trim().toLowerCase();
 
-  if (!shopifyOrderId || !email) {
+  if (!shopifyOrderId) {
     return res.status(400).send(payPortalHTML(
       'Missing Information',
       '<p>Order details are missing. Please return to your order confirmation email and try again.</p>',
@@ -3070,7 +3182,7 @@ app.get('/pay/:shopifyOrderId', async (req, res) => {
 
   logger.info('Pay portal accessed', { shopifyOrderId, hasEmail: !!email });
 
-  let txn = getTransactionByShopifyOrderId(shopifyOrderId);
+  let txn = await getTransactionByShopifyOrderId(shopifyOrderId);
 
   // ── Already paid ──
   if (txn && txn.status === 'paid') {
@@ -3078,7 +3190,7 @@ app.get('/pay/:shopifyOrderId', async (req, res) => {
   }
 
   // ── Email mismatch ──
-  if (txn && txn.customerEmail && email !== txn.customerEmail.trim().toLowerCase()) {
+  if (txn && email && txn.customerEmail && email !== txn.customerEmail.trim().toLowerCase()) {
     logger.warn('Pay portal email mismatch', { shopifyOrderId, provided: email });
     return res.status(403).send(payPortalHTML(
       'Access Denied',
@@ -3091,6 +3203,55 @@ app.get('/pay/:shopifyOrderId', async (req, res) => {
   if (txn && txn.status === 'initiated' && txn.redirectUrl) {
     logger.info('Pay portal redirecting to Till HPP (existing)', { shopifyOrderId, txnId: txn.txnId });
     return res.redirect(302, txn.redirectUrl);
+  }
+
+  if (txn && txn.status === 'pending' && txn.tillError === 'duplicate_transaction_in_progress') {
+    logger.info('Pay portal — duplicate Till transaction already in progress, switching to recovery flow', {
+      shopifyOrderId,
+      txnId: txn.txnId
+    });
+    return renderPayPortalRecovery(res, shopifyOrderId, email);
+  }
+
+  // ── Fresh checkout race: give the webhook-created transaction a chance to land ──
+  if (!txn) {
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      logger.info('Pay portal — waiting for webhook transaction', { shopifyOrderId, attempt });
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      txn = await getTransactionByShopifyOrderId(shopifyOrderId);
+
+      if (txn && txn.status === 'paid') {
+        return res.redirect(302, SUCCESS_URL);
+      }
+
+      if (txn && email && txn.customerEmail && email !== txn.customerEmail.trim().toLowerCase()) {
+        logger.warn('Pay portal email mismatch after webhook wait', { shopifyOrderId, provided: email });
+        return res.status(403).send(payPortalHTML(
+          'Access Denied',
+          '<p>The email address does not match this order. Please use the link from your order confirmation.</p>',
+          false
+        ));
+      }
+
+      if (txn && txn.status === 'initiated' && txn.redirectUrl) {
+        logger.info('Pay portal redirecting to Till HPP after webhook wait', { shopifyOrderId, txnId: txn.txnId, attempt });
+        return res.redirect(302, txn.redirectUrl);
+      }
+
+      if (txn && txn.status === 'pending' && txn.tillError === 'duplicate_transaction_in_progress') {
+        logger.info('Pay portal — duplicate Till transaction detected after webhook wait, switching to recovery flow', {
+          shopifyOrderId,
+          txnId: txn.txnId,
+          attempt
+        });
+        return renderPayPortalRecovery(res, shopifyOrderId, email);
+      }
+    }
+
+    logger.info('Pay portal — webhook transaction still unavailable after wait, switching to recovery flow', {
+      shopifyOrderId
+    });
+    return renderPayPortalRecovery(res, shopifyOrderId, email);
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -3110,7 +3271,7 @@ app.get('/pay/:shopifyOrderId', async (req, res) => {
       await new Promise(r => setTimeout(r, 3000));
 
       // Check if webhook processed it while we waited
-      const txnRetry = getTransactionByShopifyOrderId(shopifyOrderId);
+      const txnRetry = await getTransactionByShopifyOrderId(shopifyOrderId);
       if (txnRetry && txnRetry.status === 'initiated' && txnRetry.redirectUrl) {
         logger.info('Pay portal — webhook arrived during retry wait', { shopifyOrderId, txnId: txnRetry.txnId });
         return res.redirect(302, txnRetry.redirectUrl);
@@ -3145,7 +3306,7 @@ app.get('/pay/:shopifyOrderId', async (req, res) => {
 
     // ── Verify email matches the order ──
     const orderEmail = (order.email || '').trim().toLowerCase();
-    if (orderEmail && email !== orderEmail) {
+    if (email && orderEmail && email !== orderEmail) {
       logger.warn('Pay portal email mismatch (from Shopify)', { shopifyOrderId, provided: email, orderEmail });
       return res.status(403).send(payPortalHTML(
         'Access Denied',
@@ -3167,7 +3328,7 @@ app.get('/pay/:shopifyOrderId', async (req, res) => {
     const txnId       = `HOC-${orderNumber}`;
 
     // ── Idempotency: check if transaction was created between our first check and now ──
-    const existingTxn = getTransaction(txnId);
+    const existingTxn = await getTransaction(txnId);
     if (existingTxn && existingTxn.status === 'initiated' && existingTxn.redirectUrl) {
       logger.info('Pay portal — transaction appeared (race resolved)', { shopifyOrderId, txnId });
       return res.redirect(302, existingTxn.redirectUrl);
@@ -3219,7 +3380,7 @@ app.get('/pay/:shopifyOrderId', async (req, res) => {
     };
 
     // ── Save pending transaction ──
-    saveTransaction({
+    await saveTransaction({
       txnId,
       status: 'pending',
       shopifyOrderId: String(orderId),
@@ -3246,7 +3407,7 @@ app.get('/pay/:shopifyOrderId', async (req, res) => {
         hasRedirectUrl: !!redirectUrl
       });
 
-      saveTransaction({
+      await saveTransaction({
         txnId,
         status: 'initiated',
         tillUuid,
@@ -3269,14 +3430,26 @@ app.get('/pay/:shopifyOrderId', async (req, res) => {
     }
 
     // ── Till returned an error ──
-    const tillError = tillRes.body?.errors?.[0] || {};
+    const tillError = getTillErrorDetails(tillRes.body);
+    const isDuplicateTxn = String(tillError.errorCode) === '3004';
     logger.error('Pay portal — Till debit failed', { shopifyOrderId, txnId, tillError });
 
-    saveTransaction({
+    await saveTransaction({
       txnId,
-      status: 'failed',
-      tillError: tillRes.rawBody?.substring(0, 500)
+      status: isDuplicateTxn ? 'pending' : 'failed',
+      tillError: isDuplicateTxn
+        ? 'duplicate_transaction_in_progress'
+        : tillRes.rawBody?.substring(0, 500)
     });
+
+    if (isDuplicateTxn) {
+      logger.warn('Pay portal — duplicate Till transaction detected, switching to recovery flow', {
+        shopifyOrderId,
+        txnId,
+        errorCode: tillError.errorCode
+      });
+      return renderPayPortalRecovery(res, shopifyOrderId, email);
+    }
 
     return res.status(502).send(payPortalHTML(
       'Payment Unavailable',
@@ -3337,29 +3510,38 @@ function payPortalHTML(title, bodyContent, showPoll, pollUrl, reloadUrl) {
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
     body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-      background:#0a0a0a;color:#fff;display:flex;align-items:center;justify-content:center;
+      background:#132b38;color:#c1f9f9;display:flex;align-items:center;justify-content:center;
       min-height:100vh;text-align:center;padding:1.5rem}
-    .card{max-width:480px;width:100%;background:#1a1a1a;border-radius:16px;padding:2.5rem 2rem;
-      box-shadow:0 8px 32px rgba(0,0,0,.5)}
-    .logo{font-size:1.6rem;font-weight:700;letter-spacing:.04em;margin-bottom:.25rem;
-      background:linear-gradient(135deg,#c9a96e,#f5d998);-webkit-background-clip:text;
-      -webkit-text-fill-color:transparent}
-    .subtitle{font-size:.8rem;color:#888;margin-bottom:2rem;text-transform:uppercase;letter-spacing:.1em}
-    h1{font-size:1.4rem;margin-bottom:1rem;color:#f0f0f0}
-    p{color:#bbb;line-height:1.6;margin-bottom:1rem;font-size:.95rem}
-    .small{font-size:.8rem;color:#666}
-    a{color:#c9a96e;text-decoration:underline}
-    .spinner{width:36px;height:36px;border:3px solid #333;border-top:3px solid #c9a96e;
-      border-radius:50%;animation:spin .8s linear infinite;margin:1.5rem auto}
+    .card{max-width:480px;width:100%;background:#082738;
+      border:1px solid rgba(193,249,249,0.18);border-radius:28px;padding:3rem 2.5rem;
+      box-shadow:0 24px 60px rgba(0,0,0,0.28)}
+    .logo{font-size:1.5rem;font-weight:700;letter-spacing:.18em;margin-bottom:.3rem;
+      color:#c1f9f9;text-transform:uppercase}
+    .subtitle{font-size:.7rem;color:rgba(193,249,249,0.38);margin-bottom:2rem;
+      text-transform:uppercase;letter-spacing:.18em}
+    h1{font-size:clamp(1.2rem,3vw,1.5rem);font-weight:700;margin-bottom:1rem;
+      color:#c1f9f9;text-transform:uppercase;letter-spacing:.08em}
+    p{color:rgba(193,249,249,0.72);line-height:1.7;margin-bottom:1rem;font-size:.95rem}
+    .small{font-size:.78rem;color:rgba(193,249,249,0.4)}
+    a{color:rgba(193,249,249,0.7);text-decoration:underline}
+    .spinner{width:44px;height:44px;
+      border:2.5px solid rgba(193,249,249,0.1);border-top:2.5px solid rgba(122,171,140,0.7);
+      border-radius:50%;animation:spin .9s linear infinite;margin:1.5rem auto}
     @keyframes spin{to{transform:rotate(360deg)}}
-    .lock{font-size:.75rem;color:#555;margin-top:2rem;display:flex;align-items:center;
-      justify-content:center;gap:.4rem}
-    .lock svg{width:14px;height:14px;fill:#555}
+    .lock{font-size:.65rem;color:rgba(193,249,249,0.38);margin-top:2rem;display:flex;
+      align-items:center;justify-content:center;gap:.4rem;text-transform:uppercase;letter-spacing:.06em}
+    .lock svg{width:12px;height:12px;fill:rgba(193,249,249,0.38)}
   </style>
 </head>
 <body>
   <div class="card">
-    <div class="logo">HIGH ON CHAPEL</div>
+    <div class="logo">High on Chapel
+<body>
+  <div class="card">
+    <div class="logo">High on Chapel
+<body>
+  <div class="card">
+    <div class="logo">High on Chapel</div>
     <div class="subtitle">Secure Payments</div>
     <h1>${title}</h1>
     <div id="msg">${bodyContent}</div>
@@ -3375,14 +3557,21 @@ function payPortalHTML(title, bodyContent, showPoll, pollUrl, reloadUrl) {
 
 // ─── Start Server ───────────────────────────────────────────────────────────
 
-app.listen(PORT, () => {
-  logger.info('HOCS Till Middleware started', {
-    port: PORT,
-    env: NODE_ENV,
-    tillEndpoint: TILL_BASE_URL,
-    shopifyStore: SHOPIFY_STORE_DOMAIN,
-    callbackUrl: CALLBACK_URL
+initDatabase()
+  .then(() => {
+    app.listen(PORT, () => {
+      logger.info('HOCS Till Middleware started', {
+        port: PORT,
+        env: NODE_ENV,
+        tillEndpoint: TILL_BASE_URL,
+        shopifyStore: SHOPIFY_STORE_DOMAIN,
+        callbackUrl: CALLBACK_URL
+      });
+    });
+  })
+  .catch((err) => {
+    logger.error('Failed to initialize PostgreSQL', { error: err.message, stack: err.stack });
+    process.exit(1);
   });
-});
 
 module.exports = app; // For testing
