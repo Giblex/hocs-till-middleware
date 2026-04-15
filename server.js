@@ -53,8 +53,9 @@ const {
 
   // Shopify credentials (Custom App — 2026 Dev Dashboard)
   SHOPIFY_STORE_DOMAIN,            // e.g. "highonchapel.myshopify.com"
-  SHOPIFY_CLIENT_ID,               // Client ID from Dev Dashboard → Settings
-  SHOPIFY_CLIENT_SECRET,           // Client Secret from Dev Dashboard → Settings
+  SHOPIFY_ACCESS_TOKEN,            // Admin API access token (shpat_...) from App → API credentials
+  SHOPIFY_CLIENT_ID,               // Client ID from Dev Dashboard → Settings (used for webhook verification)
+  SHOPIFY_CLIENT_SECRET,           // Client Secret from Dev Dashboard → Settings (used for webhook verification)
   SHOPIFY_WEBHOOK_SECRET,          // HMAC secret for verifying Shopify webhooks
   SHOPIFY_STORE_WEBHOOK_SECRET,    // Optional: store-level webhook signing key (Admin → Settings → Notifications)
 
@@ -82,7 +83,7 @@ const {
 
 const REQUIRED_ENV = [
   'TILL_API_KEY', 'TILL_SHARED_SECRET', 'TILL_API_USER', 'TILL_API_PASS',
-  'SHOPIFY_STORE_DOMAIN', 'SHOPIFY_CLIENT_ID', 'SHOPIFY_CLIENT_SECRET',
+  'SHOPIFY_STORE_DOMAIN', 'SHOPIFY_ACCESS_TOKEN', 'SHOPIFY_CLIENT_SECRET',
   'SHOPIFY_WEBHOOK_SECRET', 'CALLBACK_URL', 'DATABASE_URL'
 ];
 
@@ -399,48 +400,13 @@ async function completeHPP(redirectUrl, cardNumber = '4111111111111111', expectD
 
 const SHOPIFY_API_VERSION = '2025-01';
 
-let _shopifyToken = null;
-let _shopifyTokenExpiresAt = 0;
-
 async function getShopifyAccessToken() {
-  // Return cached token if still valid (refresh 60s before expiry)
-  if (_shopifyToken && Date.now() < _shopifyTokenExpiresAt - 60_000) {
-    return _shopifyToken;
+  // Custom apps use a static Admin API access token (shpat_...) — no OAuth exchange needed.
+  // Shopify does not support the client_credentials grant type.
+  if (!SHOPIFY_ACCESS_TOKEN) {
+    throw new Error('SHOPIFY_ACCESS_TOKEN env var is not set. Get it from Shopify Admin → Apps → Develop apps → [App] → API credentials.');
   }
-
-  logger.info('Requesting new Shopify access token via client credentials grant');
-
-  const { URLSearchParams } = require('url');
-  const response = await fetch(
-    `https://${SHOPIFY_STORE_DOMAIN}/admin/oauth/access_token`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type:    'client_credentials',
-        client_id:     SHOPIFY_CLIENT_ID,
-        client_secret: SHOPIFY_CLIENT_SECRET,
-      }),
-    }
-  );
-
-  if (!response.ok) {
-    const errText = await response.text().catch(() => 'no body');
-    logger.alert('Failed to obtain Shopify access token', {
-      status: response.status,
-      error: errText.substring(0, 500)
-    });
-    throw new Error(`Shopify token request failed: ${response.status}`);
-  }
-
-  const data = await response.json();
-  _shopifyToken = data.access_token;
-  // Default to 24hr expiry if not provided
-  const expiresIn = data.expires_in || 86400;
-  _shopifyTokenExpiresAt = Date.now() + (expiresIn * 1000);
-
-  logger.info('Shopify access token obtained', { expiresInSeconds: expiresIn });
-  return _shopifyToken;
+  return SHOPIFY_ACCESS_TOKEN;
 }
 
 async function shopifyAdminAPI(method, path, body = null) {
@@ -459,11 +425,8 @@ async function shopifyAdminAPI(method, path, body = null) {
   const json = await res.json().catch(() => null);
 
   if (!res.ok) {
-    // If 401, token may have expired early — force refresh on next call
     if (res.status === 401) {
-      _shopifyToken = null;
-      _shopifyTokenExpiresAt = 0;
-      logger.warn('Shopify token appears expired, cleared cache for retry');
+      logger.warn('Shopify Admin API returned 401 — check that SHOPIFY_ACCESS_TOKEN is valid and the app has write_orders scope');
     }
     logger.error('Shopify Admin API error', { status: res.status, path, body: JSON.stringify(json).substring(0, 500) });
   }

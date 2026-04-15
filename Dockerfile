@@ -1,6 +1,6 @@
 FROM node:18-bookworm-slim
 
-# System deps for Chromium (puppeteer-core) and native modules (better-sqlite3)
+# System deps for Chromium (puppeteer-core)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       chromium \

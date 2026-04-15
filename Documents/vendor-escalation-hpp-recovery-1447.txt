@@ -1,0 +1,53 @@
+Subject: Request for Till/PayNuts guidance on recovering an existing Hosted Payment Page session for HOC-1447
+
+Hi PayNuts / Till Support,
+
+We need guidance on the correct recovery flow for an existing Hosted Payment Page (HPP) session in production.
+
+Merchant:
+- High on Chapel
+
+Environment:
+- Production
+
+Our middleware callback URL:
+- https://hocs-till-middleware-production.up.railway.app/api/till-callback
+
+Known transaction identifiers:
+- merchantTransactionId: HOC-1447
+- Shopify order number: 1447
+- Shopify order ID: 6703197880507
+- Customer email: milocosmas@gmail.com
+
+What happened:
+- Our middleware previously attempted to create a Till debit for merchantTransactionId `HOC-1447`
+- Till returned error code `3004` with message that the transaction ID already exists
+- This indicates Till already has a transaction/session for that merchantTransactionId in production
+- At the time, our app no longer had the local transaction state needed to resume the customer flow
+
+What we need from you:
+1. Please confirm whether a production transaction currently exists for `merchantTransactionId = HOC-1447`
+2. Please provide the Till transaction identifiers for that session, including any available:
+- uuid
+- referenceUuid
+- purchaseId
+- current status / result / returnType
+3. Please confirm whether the customer ever completed the hosted payment page, or whether the session remained incomplete / expired / pending
+4. Please confirm whether there is a supported API endpoint or merchant-portal workflow to recover or resume an already-created HPP session when we only have:
+- merchantTransactionId
+- and/or uuid / purchaseId
+5. If such a recovery flow exists, please provide:
+- the correct endpoint or portal path
+- the expected request parameters
+- whether it returns a fresh `redirectUrl` or another resume token
+6. If no API exists, please confirm the correct operational procedure your merchants should use when Till returns `3004 duplicate transaction ID` but the original hosted payment page URL has been lost
+
+Important context:
+- We have already fixed our middleware so duplicate transaction IDs no longer surface as a hard customer-facing failure
+- We now keep the order in a recovery/pending state and wait for reconciliation
+- What we still need is the official Till/PayNuts method for recovering the original HPP session, if one exists
+
+If helpful, we can also provide request timestamps from our Railway logs for the original duplicate response.
+
+Thanks,
+Alex

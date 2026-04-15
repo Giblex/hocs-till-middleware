@@ -1,0 +1,36 @@
+Subject: Evidence request for HOC order #1443 / Till callback classification issue
+
+Hi PayNuts / Till / Nuvei team,
+
+We are investigating a production payment issue for High on Chapel and need the exact gateway-side evidence for this transaction.
+
+Merchant-side identifiers:
+- Shopify order number: 1443
+- Merchant transaction ID: HOC-1443
+- Till UUID: 2de8fedaa6a7f28cd092
+- Purchase ID: 20260322-2de8fedaa6a7f28cd092
+- Amount: 71.00 AUD
+- Callback URL configured: https://hocs-till-middleware-production.up.railway.app/api/till-callback
+
+What we can confirm on our side:
+- Shopify webhook was received and processed
+- Till debit was created successfully in production
+- Customer was redirected to the hosted payment page
+- We received a signed Till callback for this transaction
+- The callback included result=OK, amount=71.00, currency=AUD
+- Our middleware did not receive enough terminal metadata to classify the callback as finished, so Shopify was not marked paid
+
+Please confirm:
+1. Whether this transaction exists in production and its final state
+2. Whether it is FINISHED, PENDING, REDIRECT, ERROR, settled, voided, expired, or otherwise
+3. The exact callback payload sent to our callback URL for this transaction
+4. Whether the callback payload included merchantTransactionId, uuid, referenceUuid, purchaseId, returnType, status, or transactionStatus
+5. The exact callback timestamps, HTTP response code, and any retry attempts
+6. Whether returnType can be omitted on a successful payment callback
+7. Whether the customer only completed an authorisation/hold rather than a captured payment
+8. Which merchant portal is the correct source of truth for this integration, as we currently have multiple Nuvei/Till login screens
+
+If possible, please also confirm whether there is a status endpoint or portal view we should use for historical transaction verification when `/api/v3/status/...` returns no record.
+
+Thanks,
+High on Chapel / HOCS middleware investigation
