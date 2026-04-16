@@ -31,7 +31,6 @@ const crypto     = require('crypto');
 const path       = require('path');
 const fetch      = require('node-fetch');   // node-fetch@2 for CJS compatibility
 const rateLimit  = require('express-rate-limit');
-const nodemailer = require('nodemailer');
 const { Pool }   = require('pg');
 
 // Optional: Puppeteer for HPP auto-completion (cert testing)
@@ -67,13 +66,6 @@ const {
   ERROR_URL             = 'https://highonchapel.com/pages/payment-error',
   CALLBACK_URL,                    // Must be this server's public URL + /api/till-callback
   DATABASE_URL,
-
-  // Email / SMTP (for sending payment link emails)
-  SMTP_HOST        = '',           // e.g. smtp.gmail.com, smtp.sendgrid.net
-  SMTP_PORT        = '587',
-  SMTP_USER        = '',
-  SMTP_PASS        = '',
-  SMTP_FROM        = 'High on Chapel <noreply@highonchapel.com>',
 
   // Store URL
   STORE_URL        = 'https://highonchapel.com',
@@ -436,79 +428,7 @@ async function shopifyAdminAPI(method, path, body = null) {
   return { status: res.status, body: json };
 }
 
-// ─── Email Transport (Payment Link Emails) ──────────────────────────────────
-// Sends the customer a direct link to complete their payment.
-// If SMTP not configured, logs a warning and continues (non-blocking).
-
-let mailTransport = null;
-if (SMTP_HOST && SMTP_USER && SMTP_PASS) {
-  mailTransport = nodemailer.createTransport({
-    host:   SMTP_HOST,
-    port:   parseInt(SMTP_PORT, 10),
-    secure: parseInt(SMTP_PORT, 10) === 465,
-    auth:   { user: SMTP_USER, pass: SMTP_PASS }
-  });
-  logger.info('SMTP email transport configured', { host: SMTP_HOST });
-} else {
-  logger.warn('SMTP not configured — payment link emails will NOT be sent. Set SMTP_HOST/USER/PASS.');
-}
-
-async function sendPaymentEmail(customerEmail, orderNumber, redirectUrl, amount, currency) {
-  if (!mailTransport || !customerEmail) {
-    logger.warn('Skipping payment email — no transport or no email', { orderNumber, hasEmail: !!customerEmail });
-    return;
-  }
-
-  // Build a backup link via the Complete Payment page (in case the direct link expires)
-  const completePaymentUrl = `${STORE_URL}/pages/complete-payment?order=${encodeURIComponent(orderNumber)}&email=${encodeURIComponent(customerEmail)}`;
-
-  const htmlBody = `
-<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"></head>
-<body style="margin:0;padding:0;background:#f4f4f4;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
-  <div style="max-width:500px;margin:40px auto;background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,0.08);">
-    <div style="background:#0f1b2d;padding:30px 24px;text-align:center;">
-      <h1 style="color:#ffffff;margin:0;font-size:20px;">Complete Your Payment</h1>
-      <p style="color:#8899aa;margin:8px 0 0;font-size:14px;">High on Chapel &mdash; Order #${orderNumber}</p>
-    </div>
-    <div style="padding:30px 24px;">
-      <p style="color:#333;font-size:15px;line-height:1.6;margin:0 0 16px;">
-        Thank you for your order! To complete your payment of <strong>$${amount} ${currency}</strong>,
-        please click the button below:
-      </p>
-      <div style="text-align:center;margin:24px 0;">
-        <a href="${redirectUrl}" style="display:inline-block;background:#2563eb;color:#ffffff;padding:14px 32px;border-radius:8px;text-decoration:none;font-weight:700;font-size:15px;">
-          Pay Now &rarr;
-        </a>
-      </div>
-      <p style="color:#666;font-size:13px;line-height:1.5;margin:0;">
-        If the button above doesn't work, you can also complete your payment at:<br>
-        <a href="${completePaymentUrl}" style="color:#2563eb;">${STORE_URL}/pages/complete-payment</a>
-      </p>
-    </div>
-    <div style="background:#f9fafb;padding:16px 24px;text-align:center;border-top:1px solid #eee;">
-      <p style="color:#999;font-size:11px;margin:0;">
-        Secured by Till Payments &bull; 256-bit SSL encrypted
-      </p>
-    </div>
-  </div>
-</body>
-</html>`;
-
-  try {
-    await mailTransport.sendMail({
-      from:    SMTP_FROM,
-      to:      customerEmail,
-      subject: `Complete your payment — Order #${orderNumber}`,
-      html:    htmlBody
-    });
-    logger.info('Payment link email sent', { orderNumber, to: customerEmail });
-  } catch (err) {
-    logger.error('Failed to send payment email', { orderNumber, error: err.message });
-    // Non-blocking — customer can still use the Complete Payment page
-  }
-}
+// ─── Persistent Idempotency Store (Rec #4 + #8) ────────────────────────────
 
 // ─── Persistent Idempotency Store (Rec #4 + #8) ────────────────────────────
 // PostgreSQL-backed — durable across Railway deploys and restarts.
@@ -1047,7 +967,7 @@ app.post('/api/shopify-webhook', paymentLimiter, async (req, res) => {
         .update(req.rawBody)
         .digest('base64');
 
-      logger.info('HMAC debug', {
+      logger.info'HMAC debug', {
         requestId,
         rawBodyLen: req.rawBody?.length ?? 'undefined',
         receivedHmac: hmacHeader?.substring(0, 10),
@@ -1194,16 +1114,6 @@ app.post('/api/shopify-webhook', paymentLimiter, async (req, res) => {
       });
 
       logger.info('Till debit initiated', { requestId, txnId, tillUuid });
-
-      // ── 7. Send payment link email to customer ─────────────────────────
-      // Non-blocking — don't await in the critical path; fire and log errors
-      sendPaymentEmail(
-        tillCustomer.email,
-        orderNumber,
-        redirectUrl,
-        totalPrice,
-        currency
-      ).catch(err => logger.error('Payment email error (async)', { txnId, error: err.message }));
 
       return res.status(200).json({
         status: 'initiated',
