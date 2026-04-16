@@ -2456,7 +2456,7 @@ app.get('/admin/api/debug-till-status/:txnId', async (req, res) => {
     return res.status(400).json({ error: 'Invalid txnId' });
   }
   try {
-    const uuidPath = `/status/${TILL_API_KEY}/getByMerchantTransactionId/${txnId}`;
+    const uuidPath = `/api/v3/status/${TILL_API_KEY}/getByMerchantTransactionId/${txnId}`;
     const tillRes = await callTillAPI('GET', uuidPath);
     return res.json({
       httpStatus: tillRes.status,
@@ -2482,7 +2482,7 @@ app.get('/admin/api/till/:tillUuid', async (req, res) => {
     return res.status(400).json({ error: 'Invalid UUID' });
   }
   try {
-    const tillRes = await callTillAPI('GET', `/status/${TILL_API_KEY}/getByUuid/${tillUuid}`);
+    const tillRes = await callTillAPI('GET', `/api/v3/status/${TILL_API_KEY}/getByUuid/${tillUuid}`);
     return res.json(tillRes.body || {});
   } catch (err) {
     return res.status(502).json({ error: err.message });
@@ -2551,10 +2551,10 @@ app.post('/admin/api/reconcile-all', async (req, res) => {
     try {
       // Query by our merchantTransactionId (most reliable — set by us in debit payload)
       // Falls back to Till's uuid if merchant ID lookup fails
-      let tillRes = await callTillAPI('GET', `/status/${TILL_API_KEY}/getByMerchantTransactionId/${txn.txnId}`);
+      let tillRes = await callTillAPI('GET', `/api/v3/status/${TILL_API_KEY}/getByMerchantTransactionId/${txn.txnId}`);
       let idUsed = 'merchantTransactionId';
       if (tillRes.body && tillRes.body.success === false && txn.tillUuid) {
-        const fallback = await callTillAPI('GET', `/status/${TILL_API_KEY}/getByUuid/${txn.tillUuid}`);
+        const fallback = await callTillAPI('GET', `/api/v3/status/${TILL_API_KEY}/getByUuid/${txn.tillUuid}`);
         if (fallback.body && fallback.body.success !== false) {
           tillRes = fallback;
           idUsed = 'tillUuid';
