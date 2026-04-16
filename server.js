@@ -3600,21 +3600,46 @@ app.post('/api/till/incremental/:referenceUuid', async (req, res) => {
 
 // ─── Mark Shopify Order as Paid ─────────────────────────────────────────────
 // Uses Shopify Admin API to create a transaction marking the order as paid.
-// kind:'sale' is correct for externally-processed payments — 'capture' requires
-// a prior Shopify authorization which doesn't exist here (Till handled payment).
+// If Shopify already has a 'pending' deferred-payment transaction (created when
+// the order was placed via our checkout extension), we must CAPTURE that — posting
+// a new 'sale' returns "sale is not a valid transaction" in that state.
 
 async function markShopifyOrderPaid(shopifyOrderId, tillUuid, txnId, amount) {
   try {
-    // Create a transaction to mark the order paid
-    const transactionPayload = {
-      transaction: {
-        kind:      'sale',
-        status:    'success',
-        amount:    amount,           // Explicit amount from original order
-        gateway:   'Till Payments (PayNuts)',
-        authorization: tillUuid || txnId
-      }
-    };
+    // Fetch existing transactions — Shopify creates a 'pending' transaction for deferred
+    // payment gateways (like our Till redirect flow).  We must capture that rather than
+    // posting a new 'sale', otherwise Shopify rejects with "sale is not a valid transaction".
+    const txnListRes = await shopifyAdminAPI('GET', `/orders/${shopifyOrderId}/transactions.json`);
+    const existing   = (txnListRes.body && Array.isArray(txnListRes.body.transactions))
+                         ? txnListRes.body.transactions
+                         : [];
+
+    // Prefer capturing a pending deferred-payment transaction, then fall back to an
+    // existing authorization.  If neither exists, fall through to a plain sale.
+    const parentTxn = existing.find(t => t.kind === 'pending'       && t.status === 'pending')
+                   || existing.find(t => t.kind === 'authorization'  && t.status === 'success');
+
+    const transactionPayload = parentTxn
+      ? {
+          transaction: {
+            kind:          'capture',
+            status:        'success',
+            amount:        amount,
+            parent_id:     parentTxn.id,
+            gateway:       parentTxn.gateway,
+            authorization: tillUuid || txnId
+          }
+        }
+      : {
+          transaction: {
+            kind:          'sale',
+            status:        'success',
+            amount:        amount,
+            gateway:       'Till Payments (PayNuts)',
+            source:        'external',
+            authorization: tillUuid || txnId
+          }
+        };
 
     const result = await shopifyAdminAPI(
       'POST',
