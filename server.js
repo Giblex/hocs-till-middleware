@@ -2443,6 +2443,32 @@ app.get('/admin/api/debug-txns', async (req, res) => {
   return res.json(rows);
 });
 
+// DEBUG ENDPOINT: GET /admin/api/debug-till-status/:txnId
+// Calls Till getByMerchantTransactionId and returns the raw + parsed response.
+// Remove after debugging.
+
+app.get('/admin/api/debug-till-status/:txnId', async (req, res) => {
+  if (!DASHBOARD_SECRET || req.query.secret !== DASHBOARD_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const { txnId } = req.params;
+  if (!txnId || !/^[\w-]+$/.test(txnId)) {
+    return res.status(400).json({ error: 'Invalid txnId' });
+  }
+  try {
+    const uuidPath = `/status/${TILL_API_KEY}/getByMerchantTransactionId/${txnId}`;
+    const tillRes = await callTillAPI('GET', uuidPath);
+    return res.json({
+      httpStatus: tillRes.status,
+      parsedBody: tillRes.body,
+      rawBody: tillRes.rawBody,
+      pathUsed: uuidPath
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Proxies Till status API for a single transaction. Used by the dashboard JS
 // to show live Till payment details. Protected by DASHBOARD_SECRET.
