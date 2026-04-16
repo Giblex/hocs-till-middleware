@@ -2425,6 +2425,25 @@ app.get('/api/cert/run-all', async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 // ENDPOINT: GET /admin/api/till/:tillUuid
 // ═════════════════════════════════════════════════════════════════════════════
+// DEBUG ENDPOINT: GET /admin/api/debug-txns
+// Returns stuck initiated/pending transactions as JSON including purchase_id.
+// Remove after debugging.
+
+app.get('/admin/api/debug-txns', async (req, res) => {
+  if (!DASHBOARD_SECRET || req.query.secret !== DASHBOARD_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const { rows } = await pool.query(
+    `SELECT txn_id, status, till_uuid, purchase_id, shopify_order_id, order_number, amount, customer_email, created_at
+     FROM transactions
+     WHERE status NOT IN ('paid','reconciled','cancelled')
+     AND till_uuid IS NOT NULL
+     ORDER BY created_at DESC`
+  );
+  return res.json(rows);
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
 // Proxies Till status API for a single transaction. Used by the dashboard JS
 // to show live Till payment details. Protected by DASHBOARD_SECRET.
 
@@ -2504,7 +2523,16 @@ app.post('/admin/api/reconcile-all', async (req, res) => {
   for (const row of pending) {
     const txn = mapTransactionRow(row);
     try {
-      const tillRes = await callTillAPI('GET', `/api/v3/status/${TILL_API_KEY}/${txn.tillUuid}`);
+      // Try till_uuid first; if Till returns "Not Found", fall back to purchase_id
+      let tillRes = await callTillAPI('GET', `/api/v3/status/${TILL_API_KEY}/${txn.tillUuid}`);
+      let idUsed = 'tillUuid';
+      if (tillRes.body && tillRes.body.success === false && txn.purchaseId) {
+        const fallback = await callTillAPI('GET', `/api/v3/status/${TILL_API_KEY}/${txn.purchaseId}`);
+        if (fallback.body && fallback.body.success !== false) {
+          tillRes = fallback;
+          idUsed = 'purchaseId';
+        }
+      }
       const ts = tillRes.body || {};
 
       const isSuccess = ts.result === 'OK' ||
@@ -2545,7 +2573,9 @@ app.post('/admin/api/reconcile-all', async (req, res) => {
           txnId: txn.txnId,
           orderNumber: txn.orderNumber,
           outcome: 'not_paid',
-          tillResult: ts.result || ts.status || ts.returnType || 'unknown'
+          idUsed,
+          purchaseId: txn.purchaseId || null,
+          tillResult: ts.result || ts.status || ts.returnType || (ts.success === false ? 'not_found' : 'unknown')
         });
       }
     } catch (err) {
