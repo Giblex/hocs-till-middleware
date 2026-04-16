@@ -633,7 +633,7 @@ async function getTransactionByPurchaseId(purchaseId) {
   return mapTransactionRow(rows[0]);
 }
 
-async function getAllTransactions({ limit = 200, offset = 0, status = null, search = null } = {}) {
+async function getAllTransactions({ limit = 200, offset = 0, status = null, search = null, excludeStatuses = null } = {}) {
   let where = 'WHERE 1=1';
   const params = [];
   let idx = 1;
@@ -641,6 +641,9 @@ async function getAllTransactions({ limit = 200, offset = 0, status = null, sear
   if (status) {
     where += ` AND status = $${idx++}`;
     params.push(status);
+  } else if (Array.isArray(excludeStatuses) && excludeStatuses.length) {
+    where += ` AND status NOT IN (${excludeStatuses.map(() => `$${idx++}`).join(',')})`;
+    params.push(...excludeStatuses);
   }
   if (search) {
     const like = `%${search}%`;
@@ -649,14 +652,14 @@ async function getAllTransactions({ limit = 200, offset = 0, status = null, sear
     idx++;
   }
 
-  params.push(limit, offset);
+  const dataParams = [...params, limit, offset];
   const { rows } = await pool.query(
-    `SELECT * FROM transactions ${where} ORDER BY created_at DESC LIMIT $${idx++} OFFSET $${idx++}`,
-    params
+    `SELECT * FROM transactions ${where} ORDER BY created_at DESC LIMIT $${idx} OFFSET $${idx + 1}`,
+    dataParams
   );
   const { rows: countRows } = await pool.query(
     `SELECT COUNT(*) AS total FROM transactions ${where}`,
-    params.slice(0, -2)
+    params
   );
   return { rows: rows.map(mapTransactionRow), total: parseInt(countRows[0].total, 10) };
 }
@@ -718,6 +721,8 @@ const app = express();
 // ── Raw body capture for signature verification ─────────────────────────────
 // We need the raw body for both Shopify HMAC and Till X-Signature verification,
 // so we capture it before JSON parsing.
+
+app.use(express.static(path.join(__dirname, 'public')));
 
 app.use(express.json({
   verify: (req, _res, buf) => { req.rawBody = buf; }
@@ -1041,6 +1046,15 @@ app.post('/api/shopify-webhook', paymentLimiter, async (req, res) => {
         .createHmac('sha256', secret)
         .update(req.rawBody)
         .digest('base64');
+
+      logger.info('HMAC debug', {
+        requestId,
+        rawBodyLen: req.rawBody?.length ?? 'undefined',
+        receivedHmac: hmacHeader?.substring(0, 10),
+        computedHmac: computedHmac?.substring(0, 10),
+        secretPrefix: secret?.substring(0, 8),
+        contentType: req.get('content-type'),
+      });
 
       if (computedHmac.length === hmacHeader.length &&
           crypto.timingSafeEqual(Buffer.from(computedHmac), Buffer.from(hmacHeader))) {
@@ -2499,6 +2513,141 @@ app.get('/api/cert/run-all', async (req, res) => {
 // Fires all tests automatically on button click. Shows UUID + remark per test.
 
 // ═════════════════════════════════════════════════════════════════════════════
+// ENDPOINT: GET /admin/api/till/:tillUuid
+// ═════════════════════════════════════════════════════════════════════════════
+// Proxies Till status API for a single transaction. Used by the dashboard JS
+// to show live Till payment details. Protected by DASHBOARD_SECRET.
+
+app.get('/admin/api/till/:tillUuid', async (req, res) => {
+  if (!DASHBOARD_SECRET || req.query.secret !== DASHBOARD_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const { tillUuid } = req.params;
+  if (!tillUuid || !/^[\w-]+$/.test(tillUuid)) {
+    return res.status(400).json({ error: 'Invalid UUID' });
+  }
+  try {
+    const tillRes = await callTillAPI('GET', `/api/v3/status/${TILL_API_KEY}/${tillUuid}`);
+    return res.json(tillRes.body || {});
+  } catch (err) {
+    return res.status(502).json({ error: err.message });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════════════════
+// ENDPOINT: POST /admin/api/mark-paid/:txnId
+// ═════════════════════════════════════════════════════════════════════════════
+// Manually marks an order as paid in Shopify and updates our DB.
+// Use when Till's API can't confirm (expired session / Hike POS payment).
+// Body: { amount: "84.55" }  — optional, defaults to stored order amount.
+// Protected by DASHBOARD_SECRET.
+
+app.post('/admin/api/mark-paid/:txnId', async (req, res) => {
+  if (!DASHBOARD_SECRET || req.query.secret !== DASHBOARD_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const { txnId } = req.params;
+  const txn = await getTransaction(txnId).catch(() => null);
+  if (!txn) return res.status(404).json({ error: 'Transaction not found' });
+  if (txn.status === 'paid') return res.json({ status: 'already_paid' });
+
+  const amount = (req.body && req.body.amount) ? String(req.body.amount) : txn.amount;
+  const note   = (req.body && req.body.note)   ? String(req.body.note)   : 'Manually marked paid via HOCS admin dashboard';
+
+  const markResult = await markShopifyOrderPaid(txn.shopifyOrderId, txn.tillUuid || txnId, txnId, amount);
+  if (!markResult.success) {
+    return res.status(502).json({ error: 'Shopify update failed', details: markResult.error });
+  }
+
+  await saveTransaction({ txnId, status: 'paid', tillUuid: txn.tillUuid });
+  logger.info('Admin manually marked order paid', { txnId, shopifyOrderId: txn.shopifyOrderId, amount, note });
+  return res.json({ status: 'paid', txnId, orderNumber: txn.orderNumber, amount });
+});
+
+// ENDPOINT: POST /admin/api/reconcile-all
+// ═════════════════════════════════════════════════════════════════════════════
+// Checks every non-paid transaction that has a Till UUID against Till's status
+// API. Any that Till confirms as paid get marked paid in our DB + Shopify.
+// Uses the actual Till charged amount (including surcharge) for the Shopify
+// transaction record. Protected by DASHBOARD_SECRET.
+
+app.post('/admin/api/reconcile-all', async (req, res) => {
+  if (!DASHBOARD_SECRET || req.query.secret !== DASHBOARD_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const requestId = crypto.randomUUID();
+  logger.info('Bulk reconcile started', { requestId });
+
+  // Fetch all non-paid transactions that have a Till UUID
+  const { rows: pending } = await pool.query(
+    `SELECT * FROM transactions
+     WHERE status NOT IN ('paid','reconciled','cancelled')
+     AND till_uuid IS NOT NULL
+     ORDER BY created_at DESC`
+  );
+
+  const results = [];
+  let fixed = 0;
+
+  for (const row of pending) {
+    const txn = mapTransactionRow(row);
+    try {
+      const tillRes = await callTillAPI('GET', `/api/v3/status/${TILL_API_KEY}/${txn.tillUuid}`);
+      const ts = tillRes.body || {};
+
+      const isSuccess = ts.result === 'OK' ||
+                        ts.status === 'SUCCESS' ||
+                        ts.transactionStatus === 'SUCCESS';
+
+      if (isSuccess) {
+        // Use Till's actual charged amount (includes surcharge) if available,
+        // otherwise fall back to our stored Shopify order amount.
+        const tillAmount = ts.amount != null ? String(ts.amount) : txn.amount;
+
+        const markResult = await markShopifyOrderPaid(
+          txn.shopifyOrderId, txn.tillUuid, txn.txnId, tillAmount
+        );
+
+        if (markResult.success) {
+          await saveTransaction({ txnId: txn.txnId, status: 'paid', tillUuid: txn.tillUuid });
+          logger.info('Bulk reconcile — marked paid', { requestId, txnId: txn.txnId });
+          fixed++;
+          results.push({
+            txnId: txn.txnId,
+            orderNumber: txn.orderNumber,
+            outcome: 'marked_paid',
+            shopifyAmount: txn.amount,
+            tillAmount,
+            surcharge: tillAmount !== txn.amount ? (parseFloat(tillAmount) - parseFloat(txn.amount)).toFixed(2) : '0.00'
+          });
+        } else {
+          results.push({
+            txnId: txn.txnId,
+            orderNumber: txn.orderNumber,
+            outcome: 'shopify_update_failed',
+            error: markResult.error
+          });
+        }
+      } else {
+        results.push({
+          txnId: txn.txnId,
+          orderNumber: txn.orderNumber,
+          outcome: 'not_paid',
+          tillResult: ts.result || ts.status || ts.returnType || 'unknown'
+        });
+      }
+    } catch (err) {
+      results.push({ txnId: txn.txnId, orderNumber: txn.orderNumber, outcome: 'error', error: err.message });
+    }
+  }
+
+  logger.info('Bulk reconcile complete', { requestId, checked: pending.length, fixed });
+  return res.json({ checked: pending.length, fixed, results });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
 // ENDPOINT: GET /admin
 // ═════════════════════════════════════════════════════════════════════════════
 // Transaction dashboard. Protected by DASHBOARD_SECRET query param.
@@ -2514,75 +2663,101 @@ app.get('/admin', async (req, res) => {
 <code>/admin?secret=YOUR_SECRET</code></p></body></html>`);
   }
 
-  const page    = Math.max(1, parseInt(req.query.page || '1', 10));
-  const limit   = 50;
-  const offset  = (page - 1) * limit;
-  const status  = req.query.status || null;
-  const search  = req.query.search || null;
-  const secret  = req.query.secret;
+  const page   = Math.max(1, parseInt(req.query.page || '1', 10));
+  const limit  = 50;
+  const offset = (page - 1) * limit;
+  const search = req.query.search || null;
+  const secret = req.query.secret;
+  // status filter only applies to the bottom (unpaid) section
+  const statusFilter = req.query.status || null;
 
-  let data = { rows: [], total: 0 };
+  // ── Fetch paid transactions (all, no pagination) ──────────────────────────
+  let paidData = { rows: [] };
+  let unpaidData = { rows: [], total: 0 };
   let dbError = null;
   try {
-    data = await getAllTransactions({ limit, offset, status, search });
+    paidData   = await getAllTransactions({ limit: 500, offset: 0, status: 'paid', search });
+    // unpaid = everything that isn't paid/reconciled, with optional status/search filter
+    const unpaidStatus = statusFilter && statusFilter !== 'paid' && statusFilter !== 'reconciled'
+      ? statusFilter : null;
+    unpaidData = await getAllTransactions({
+      limit, offset, search,
+      status: unpaidStatus,
+      excludeStatuses: unpaidStatus ? null : ['paid', 'reconciled']
+    });
   } catch (err) {
     dbError = err.message;
   }
 
-  const totalPages = Math.max(1, Math.ceil(data.total / limit));
-  const isLive = !TILL_BASE_URL.includes('test-gateway');
+  // Paid totals
+  let paidTotals = {};
+  for (const t of paidData.rows) {
+    const cur = t.currency || 'AUD';
+    paidTotals[cur] = (paidTotals[cur] || 0) + (parseFloat(t.amount) || 0);
+  }
+  const pendingCount = (await pool.query("SELECT COUNT(*) FROM transactions WHERE status IN ('pending','initiated')").catch(()=>({rows:[{count:0}]}))).rows[0].count;
+  const failedCount  = (await pool.query("SELECT COUNT(*) FROM transactions WHERE status = 'failed'").catch(()=>({rows:[{count:0}]}))).rows[0].count;
 
-  const statusColors = {
-    paid:             { bg: '#14532d', fg: '#86efac' },
-    pending:          { bg: '#3f2a00', fg: '#fbbf24' },
-    initiated:        { bg: '#1e3a5f', fg: '#93c5fd' },
-    failed:           { bg: '#7f1d1d', fg: '#fca5a5' },
-    amount_mismatch:  { bg: '#7c2d12', fg: '#fdba74' },
-    currency_mismatch:{ bg: '#7c2d12', fg: '#fdba74' },
-    cancelled:        { bg: '#374151', fg: '#9ca3af' },
-    reconciled:       { bg: '#064e3b', fg: '#6ee7b7' },
+  const totalPages = Math.max(1, Math.ceil(unpaidData.total / limit));
+  const isLive     = !TILL_BASE_URL.includes('test-gateway');
+
+  const SC = {
+    paid:             ['#c8e6d0','#1a4a28'],
+    pending:          ['#e8dfc0','#4a3a08'],
+    initiated:        ['#c8d8e8','#1a3050'],
+    failed:           ['#e8c8c8','#4a1818'],
+    amount_mismatch:  ['#ead4c0','#4a2808'],
+    currency_mismatch:['#ead4c0','#4a2808'],
+    cancelled:        ['#d8d8d8','#404040'],
+    reconciled:       ['#c0e0d8','#0a3828'],
   };
 
-  function badge(s) {
-    const c = statusColors[s] || { bg: '#374151', fg: '#d1d5db' };
-    return `<span style="display:inline-block;padding:2px 9px;border-radius:99px;font-size:11px;font-weight:700;background:${c.bg};color:${c.fg}">${s}</span>`;
-  }
+  const esc   = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  const badge = s => { const [bg,fg]=SC[s]||['#374151','#d1d5db']; return `<span style="display:inline-block;padding:2px 9px;border-radius:99px;font-size:11px;font-weight:700;background:${bg};color:${fg}">${s}</span>`; };
+  const fmt   = iso => { if(!iso) return '—'; const d=new Date(iso); return d.toLocaleDateString('en-AU',{day:'2-digit',month:'short',year:'numeric'})+' '+d.toLocaleTimeString('en-AU',{hour:'2-digit',minute:'2-digit',second:'2-digit'}); };
+  const qs    = (o={}) => { const p=new URLSearchParams({secret,...(statusFilter?{status:statusFilter}:{}),...(search?{search}:{})}); Object.entries(o).forEach(([k,v])=>v!=null?p.set(k,v):p.delete(k)); return '?'+p.toString(); };
 
-  function esc(s) {
-    return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-  }
-
-  function fmt(iso) {
-    if (!iso) return '—';
-    const d = new Date(iso);
-    return d.toLocaleDateString('en-AU', { day:'2-digit', month:'short', year:'numeric' })
-      + ' ' + d.toLocaleTimeString('en-AU', { hour:'2-digit', minute:'2-digit', second:'2-digit' });
-  }
-
-  function qs(overrides = {}) {
-    const p = new URLSearchParams({ secret, ...(status ? { status } : {}), ...(search ? { search } : {}) });
-    Object.entries(overrides).forEach(([k, v]) => v != null ? p.set(k, v) : p.delete(k));
-    return '?' + p.toString();
-  }
-
-  const statusOptions = ['', 'paid', 'pending', 'initiated', 'failed', 'amount_mismatch', 'currency_mismatch', 'cancelled', 'reconciled'];
-
-  const rows = data.rows.map(t => `
-  <tr>
-    <td style="font-family:monospace;white-space:nowrap">${esc(t.txnId)}</td>
-    <td style="white-space:nowrap"><a href="https://${esc(SHOPIFY_STORE_DOMAIN)}/admin/orders/${esc(t.shopifyOrderId)}" target="_blank" style="color:#60a5fa;text-decoration:none">#${esc(t.orderNumber)}</a></td>
+  const buildRows = (txns, prefix, showMarkPaid = false) => txns.map((t, i) => {
+    const hasTill = !!t.tillUuid;
+    const rowId   = `${prefix}-${i}`;
+    const tillBtn = hasTill
+      ? `<button onclick="loadTill('${esc(t.tillUuid)}','${rowId}')" id="${rowId}-btn" style="padding:4px 10px;background:#dde4ec;border:1px solid #a8b8cc;color:#2a3a58;border-radius:4px;font-size:11px;cursor:pointer;white-space:nowrap;font-family:inherit">Till Details</button>`
+      : '';
+    const markBtn = showMarkPaid
+      ? `<button onclick="markPaid('${esc(t.txnId)}','${esc(t.amount||'')}','${rowId}')" id="${rowId}-markbtn" style="padding:4px 10px;background:#d0e8d4;border:1px solid #90c0a0;color:#1a4028;border-radius:4px;font-size:11px;cursor:pointer;white-space:nowrap;margin-top:4px;display:block;font-family:inherit">Mark Paid</button>`
+      : '';
+    const paidIndicator = !showMarkPaid
+      ? `<span style="display:inline-flex;align-items:center;gap:5px;padding:3px 10px;background:#d4ead8;border:1px solid #90c8a0;border-radius:4px;font-size:11px;color:#1a4a28;white-space:nowrap"><span style="width:6px;height:6px;border-radius:50%;background:#3a9060;display:inline-block;flex-shrink:0"></span>Payment successful</span>`
+      : '';
+    return `
+  <tr id="${rowId}-main">
+    <td><span style="font-family:monospace;font-size:11px;color:#1c1a17;white-space:nowrap">${esc(t.txnId)}</span></td>
+    <td style="white-space:nowrap"><a href="https://${esc(SHOPIFY_STORE_DOMAIN)}/admin/orders/${esc(t.shopifyOrderId)}" target="_blank" style="color:#1a3a6a;text-decoration:none">#${esc(t.orderNumber)}</a></td>
     <td>${badge(t.status)}</td>
-    <td style="white-space:nowrap;font-weight:600">${t.amount ? `$${esc(t.amount)} ${esc(t.currency)}` : '—'}</td>
-    <td style="font-size:12px">${esc(t.customerEmail)}</td>
-    <td style="font-family:monospace;font-size:11px;word-break:break-all;max-width:200px">${esc(t.tillUuid) || '—'}</td>
-    <td style="font-size:11px;white-space:nowrap;color:#94a3b8">${fmt(t.createdAt)}</td>
-    <td style="font-size:11px;white-space:nowrap;color:#94a3b8">${fmt(t.updatedAt)}</td>
-    <td style="font-size:11px;color:#f87171;max-width:200px;word-break:break-all">${esc(t.tillError) || ''}</td>
-  </tr>`).join('');
+    <td style="white-space:nowrap;color:#1e2430">${t.amount ? `$${esc(t.amount)} <span style="color:#7a8090;font-size:11px">${esc(t.currency)}</span>` : '—'}</td>
+    <td style="font-size:12px;color:#4a5568">${esc(t.customerEmail)}</td>
+    <td style="font-size:11px;white-space:nowrap;color:#7a8090">${fmt(t.updatedAt)}</td>
+    <td style="font-size:11px;color:#9a3a3a;max-width:160px;word-break:break-all">${esc(t.tillError)||''}</td>
+    <td style="white-space:nowrap">${paidIndicator}${tillBtn}${markBtn}</td>
+  </tr>
+  <tr id="${rowId}-detail" style="display:none">
+    <td colspan="8" style="padding:0">
+      <div id="${rowId}-content" style="background:#d0d9e6;border-left:2px solid #8aa0be;padding:14px 18px;font-size:12px;color:#1e2430"></div>
+    </td>
+  </tr>`;
+  }).join('');
 
-  const filterSelect = statusOptions.map(s =>
-    `<option value="${s}" ${status === s || (!status && s === '') ? 'selected' : ''}>${s || 'All statuses'}</option>`
+  const paidRows   = buildRows(paidData.rows,   'p');
+  const unpaidRows = buildRows(unpaidData.rows, 'u', true);
+
+  const unpaidStatusOptions = ['','pending','initiated','failed','amount_mismatch','currency_mismatch','cancelled'];
+  const filterSelect = unpaidStatusOptions.map(s =>
+    `<option value="${s}" ${statusFilter===s||(!statusFilter&&s==='')?'selected':''}>${s||'All non-paid'}</option>`
   ).join('');
+
+  const totalsHtml = Object.entries(paidTotals).map(([cur, amt]) =>
+    `<div class="stat"><div class="stat-val">$${amt.toFixed(2)}</div><div class="stat-lbl">${cur} collected · ${paidData.rows.length} orders</div></div>`
+  ).join('') || `<div class="stat"><div class="stat-val" style="color:#344155">$0.00</div><div class="stat-lbl">AUD collected</div></div>`;
 
   const prevDisabled = page <= 1;
   const nextDisabled = page >= totalPages;
@@ -2593,89 +2768,264 @@ app.get('/admin', async (req, res) => {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>HOCS · Transactions</title>
+<title>HOCS · Payments</title>
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500&display=swap');
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0b1525;color:#e2e8f0;min-height:100vh;padding:28px 20px}
-h1{font-size:20px;font-weight:700;color:#60a5fa;margin-bottom:2px}
-.sub{color:#64748b;font-size:12px;margin-bottom:20px}
-.env-badge{display:inline-block;padding:2px 9px;border-radius:99px;font-size:10px;font-weight:700;margin-left:8px;vertical-align:middle;background:${isLive ? '#7f1d1d' : '#14532d'};color:${isLive ? '#fca5a5' : '#86efac'}}
-.toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:18px}
-.toolbar input,.toolbar select{background:#1e2d42;border:1px solid #2d3f56;color:#e2e8f0;padding:7px 12px;border-radius:6px;font-size:13px;outline:none}
-.toolbar input:focus,.toolbar select:focus{border-color:#3b82f6}
-.toolbar button{padding:7px 18px;background:#2563eb;color:#fff;border:none;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer}
-.toolbar button:hover{background:#1d4ed8}
-.summary{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:18px}
-.stat{background:#1a2636;border:1px solid #2d3f56;border-radius:8px;padding:12px 18px;min-width:110px}
-.stat-val{font-size:22px;font-weight:700;color:#e2e8f0}
-.stat-lbl{font-size:11px;color:#64748b;margin-top:2px}
-.wrap{overflow-x:auto;border-radius:10px;border:1px solid #1e2d42}
-table{width:100%;border-collapse:collapse;font-size:13px}
-thead tr{background:#1a2d42}
-th{padding:10px 12px;text-align:left;color:#93c5fd;font-weight:600;white-space:nowrap;border-bottom:2px solid #2d3f56}
-td{padding:9px 12px;border-bottom:1px solid #131f2e;vertical-align:top}
-tr:hover td{background:#162030}
-.pagination{display:flex;gap:8px;align-items:center;margin-top:18px;font-size:13px;color:#64748b}
-.pagination a{padding:6px 14px;background:#1e2d42;color:#93c5fd;border-radius:6px;text-decoration:none;border:1px solid #2d3f56}
-.pagination a:hover{background:#2d3f56}
-.pagination .cur{padding:6px 14px;background:#2563eb;color:#fff;border-radius:6px}
-.err{background:#1a0a0a;border:1px solid #7f1d1d;color:#fca5a5;padding:14px;border-radius:8px;margin-bottom:18px;font-size:13px}
-.empty{text-align:center;padding:40px;color:#475569;font-size:14px}
+body{font-family:'Aptos','Segoe UI',Inter,system-ui,sans-serif;font-weight:400;background:#0e1118;color:#c8cdd6;min-height:100vh;padding:32px 24px;font-size:13px;line-height:1.5}
+h1{font-size:18px;font-weight:500;color:#a8b8cc;margin-bottom:3px;letter-spacing:-0.01em}
+.sub{color:#4a5568;font-size:12px;margin-bottom:0}
+.env-badge{display:inline-block;padding:2px 10px;border-radius:99px;font-size:10px;font-weight:500;margin-left:8px;vertical-align:middle;background:${isLive?'#2e1515':'#132413'};color:${isLive?'#b87c7c':'#7aaa88'};border:1px solid ${isLive?'#5c2a2a':'#2a5234'}}
+.section{margin-bottom:44px}
+.section-hdr{display:flex;align-items:center;gap:12px;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid}
+.section-hdr.green{border-color:#2a4a35}.section-hdr.grey{border-color:#1e2a38}
+.section-title{font-size:13px;font-weight:500}
+.section-title.green{color:#7aaa88}.section-title.grey{color:#6b7a8d}
+.section-count{padding:2px 10px;border-radius:99px;font-size:11px;font-weight:400}
+.section-count.green{background:#132413;color:#7aaa88;border:1px solid #2a5234}.section-count.grey{background:#161e29;color:#4a5b6d;border:1px solid #1e2d3d}
+.stats{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px}
+.stat{background:#141b24;border:1px solid #1e2a38;border-radius:12px;padding:14px 20px;min-width:130px}
+.stat-val{font-size:20px;font-weight:500;color:#a8c0a0}.stat-lbl{font-size:11px;color:#4a5568;margin-top:3px}
+.toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:16px}
+.toolbar input,.toolbar select{background:#141b24;border:1px solid #1e2a38;color:#c8cdd6;padding:7px 14px;border-radius:10px;font-size:12px;outline:none;font-family:inherit}
+.toolbar input:focus,.toolbar select:focus{border-color:#3a5a7a}
+.toolbar button{padding:7px 20px;background:#1a2d42;color:#7a9dbf;border:1px solid #253a52;border-radius:10px;font-size:12px;font-weight:400;cursor:pointer;font-family:inherit}
+.toolbar button:hover{background:#1e3550;color:#9ab8d4}
+.wrap{overflow-x:auto;border-radius:14px;border:1px solid #1a2436;overflow:hidden}
+table{width:100%;border-collapse:collapse;font-size:12px}
+thead tr{background:#13192a}
+thead tr th:first-child{border-top-left-radius:14px}
+thead tr th:last-child{border-top-right-radius:14px}
+th{padding:10px 14px;text-align:left;color:#5a7090;font-weight:500;white-space:nowrap;border-bottom:1px solid #1a2436;font-size:11px;text-transform:uppercase;letter-spacing:0.04em}
+tbody tr{background:#dce3ed}
+td{padding:10px 14px;border-bottom:1px solid #c8d0dc;vertical-align:middle;color:#2a3040}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:last-child td:first-child{border-bottom-left-radius:14px}
+tbody tr:last-child td:last-child{border-bottom-right-radius:14px}
+tbody tr:hover td{background:#d0d9e6}
+.pagination{display:flex;gap:8px;align-items:center;margin-top:16px;font-size:12px;color:#4a5568}
+.pagination a{padding:5px 14px;background:#141b24;color:#6a8aaa;border-radius:99px;text-decoration:none;border:1px solid #1e2a38}
+.pagination a:hover{background:#1a2436}
+.pagination .cur{padding:5px 14px;background:#1a2d42;color:#7a9dbf;border-radius:99px;border:1px solid #253a52}
+.dberr{background:#1a1010;border:1px solid #4a2020;color:#b87c7c;padding:14px;border-radius:12px;margin-bottom:20px;font-size:12px}
+.empty{text-align:center;padding:40px;color:#344155;font-size:13px}
+.till-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px;margin-bottom:10px}
+.till-field{background:#111820;border-radius:10px;padding:9px 13px;border:1px solid #1a2436}
+.till-field-lbl{font-size:10px;color:#4a5568;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px}
+.till-field-val{font-size:12px;font-weight:400;color:#c8cdd6;word-break:break-all}
+.till-ok{color:#7aaa88}.till-err{color:#b87c7c}
 </style>
 </head>
 <body>
-<h1>HOCS Transactions <span class="env-badge">${isLive ? 'LIVE' : 'SANDBOX'}</span></h1>
-<div class="sub">${esc(SHOPIFY_STORE_DOMAIN)} · ${data.total} total records</div>
+<div style="display:flex;align-items:center;gap:16px;margin-bottom:28px">
+  <img src="/HOC.png"
+       alt="High on Chapel"
+       style="height:56px;width:56px;object-fit:contain;border-radius:6px;flex-shrink:0;mix-blend-mode:screen">
+  <div>
+    <h1>HOCS Payments <span class="env-badge">${isLive?'LIVE':'SANDBOX'}</span></h1>
+    <div class="sub" style="margin-bottom:0">${esc(SHOPIFY_STORE_DOMAIN)}</div>
+  </div>
+</div>
+${dbError?`<div class="dberr">Database error: ${esc(dbError)}</div>`:''}
 
-${dbError ? `<div class="err">Database error: ${esc(dbError)}</div>` : ''}
-
-<div class="summary">
-  ${['paid','pending','initiated','failed'].map(s => {
-    const count = data.rows.filter(r => r.status === s).length;
-    const c = statusColors[s] || { fg: '#d1d5db' };
-    return `<div class="stat"><div class="stat-val" style="color:${c.fg}">${s === status ? count : '—'}</div><div class="stat-lbl">${s} (this page)</div></div>`;
-  }).join('')}
-  <div class="stat"><div class="stat-val">${data.total}</div><div class="stat-lbl">total (filtered)</div></div>
+<!-- ═══ SECTION 1: PAID ═══════════════════════════════════════════════════ -->
+<div class="section">
+  <div class="section-hdr grey">
+    <span class="section-title grey">Confirmed Payments</span>
+    <span class="section-count grey">${paidData.rows.length} orders</span>
+  </div>
+  <div class="stats">
+    ${totalsHtml}
+  </div>
+  <div class="wrap">
+  <table>
+  <thead><tr>
+    <th>Transaction ID</th><th>Order</th><th>Status</th><th>Amount</th>
+    <th>Customer</th><th>Paid At</th><th>Error</th><th></th>
+  </tr></thead>
+  <tbody>
+  ${paidRows || `<tr><td colspan="8" class="empty">No confirmed payments yet.</td></tr>`}
+  </tbody>
+  </table>
+  </div>
 </div>
 
-<form class="toolbar" method="GET" action="/admin">
-  <input type="hidden" name="secret" value="${esc(secret)}">
-  <input type="text" name="search" placeholder="Search order, email, UUID…" value="${esc(search || '')}" style="min-width:240px">
-  <select name="status">${filterSelect}</select>
-  <button type="submit">Filter</button>
-  ${(search || status) ? `<a href="${qs({ page: 1, search: null, status: null })}" style="color:#94a3b8;font-size:13px;text-decoration:none">Clear</a>` : ''}
-</form>
-
-<div class="wrap">
-<table>
-<thead><tr>
-  <th>Transaction ID</th>
-  <th>Order</th>
-  <th>Status</th>
-  <th>Amount</th>
-  <th>Customer Email</th>
-  <th>Till UUID</th>
-  <th>Created</th>
-  <th>Updated</th>
-  <th>Error</th>
-</tr></thead>
-<tbody>
-${rows || `<tr><td colspan="9" class="empty">No transactions found.</td></tr>`}
-</tbody>
-</table>
+<!-- ═══ SECTION 2: UNPAID / INCOMPLETE ══════════════════════════════════ -->
+<div class="section">
+  <div class="section-hdr grey" style="flex-wrap:wrap;gap:10px">
+    <span class="section-title grey">Incomplete / Pending</span>
+    <span class="section-count grey">${pendingCount} pending · ${failedCount} failed</span>
+    <button onclick="reconcileAll()" id="reconcile-btn" style="margin-left:auto;padding:6px 16px;background:#1e1a2e;border:1px solid #362a52;color:#8a7abf;border-radius:5px;font-size:12px;font-weight:400;cursor:pointer;font-family:inherit">Reconcile All with Till</button>
+  </div>
+  <div id="reconcile-result" style="display:none;margin-bottom:16px;padding:14px;background:#111820;border:1px solid #1e2a38;border-radius:6px;font-size:12px"></div>
+  <form class="toolbar" method="GET" action="/admin">
+    <input type="hidden" name="secret" value="${esc(secret)}">
+    <input type="text" name="search" placeholder="Search order, email, UUID…" value="${esc(search||'')}" style="min-width:220px">
+    <select name="status">${filterSelect}</select>
+    <button type="submit">Filter</button>
+    ${(search||statusFilter)?`<a href="?secret=${esc(secret)}" style="color:#4a5568;font-size:12px;text-decoration:none">Clear</a>`:''}
+  </form>
+  <div class="wrap">
+  <table>
+  <thead><tr>
+    <th>Transaction ID</th><th>Order</th><th>Status</th><th>Amount</th>
+    <th>Customer</th><th>Created</th><th>Error</th><th></th>
+  </tr></thead>
+  <tbody>
+  ${unpaidRows || `<tr><td colspan="8" class="empty">No incomplete transactions.</td></tr>`}
+  </tbody>
+  </table>
+  </div>
+  <div class="pagination">
+    ${prevDisabled?`<span style="padding:5px 13px;color:#2a3a4a">← Prev</span>`:`<a href="${qs({page:page-1})}">← Prev</a>`}
+    <span class="cur">Page ${page} of ${totalPages}</span>
+    ${nextDisabled?`<span style="padding:5px 13px;color:#2a3a4a">Next →</span>`:`<a href="${qs({page:page+1})}">Next →</a>`}
+    <span style="margin-left:8px;color:#344155">Showing ${offset+1}–${Math.min(offset+limit,unpaidData.total)} of ${unpaidData.total}</span>
+  </div>
 </div>
 
-<div class="pagination">
-  ${prevDisabled
-    ? `<span style="padding:6px 14px;color:#374151">← Prev</span>`
-    : `<a href="${qs({ page: page - 1 })}">← Prev</a>`}
-  <span class="cur">Page ${page} of ${totalPages}</span>
-  ${nextDisabled
-    ? `<span style="padding:6px 14px;color:#374151">Next →</span>`
-    : `<a href="${qs({ page: page + 1 })}">Next →</a>`}
-  <span style="margin-left:8px;color:#475569">Showing ${offset + 1}–${Math.min(offset + limit, data.total)} of ${data.total}</span>
-</div>
+<script>
+const SECRET = ${JSON.stringify(secret)};
 
+async function reconcileAll() {
+  const btn = document.getElementById('reconcile-btn');
+  const out = document.getElementById('reconcile-result');
+  btn.textContent = 'Checking Till…'; btn.disabled = true;
+  out.style.display = 'block';
+  out.innerHTML = '<span style="color:#6a8aaa">Querying Till for all pending transactions… this may take 10–30 seconds.</span>';
+  try {
+    const r = await fetch('/admin/api/reconcile-all?secret='+encodeURIComponent(SECRET), {method:'POST'});
+    const d = await r.json();
+    if (!r.ok) { out.innerHTML='<span style="color:#b87c7c">Error: '+escHtml(d.error||'Unknown')+'</span>'; return; }
+
+    const fixed   = d.results.filter(x=>x.outcome==='marked_paid');
+    const notPaid = d.results.filter(x=>x.outcome==='not_paid');
+    const errors  = d.results.filter(x=>x.outcome==='error'||x.outcome==='shopify_update_failed');
+
+    let html = \`<div style="margin-bottom:10px;font-size:12px">\`;
+    html += fixed.length
+      ? \`<span style="color:#7aaa88">\${fixed.length} payment\${fixed.length>1?'s':''} recovered and marked paid in Shopify.</span>\`
+      : \`<span style="color:#8a7a5a">No new payments found — \${d.checked} transactions checked.</span>\`;
+    html += \`</div>\`;
+
+    if (fixed.length) {
+      html += \`<div style="margin-bottom:8px;color:#5a8a6a;font-size:12px">Recovered orders:</div>\`;
+      html += \`<table style="width:100%;font-size:12px;border-collapse:collapse">\`;
+      html += \`<tr><th style="text-align:left;padding:4px 10px;color:#4a5568;font-weight:500">Order</th><th style="text-align:left;padding:4px 10px;color:#4a5568;font-weight:500">Shopify Amount</th><th style="text-align:left;padding:4px 10px;color:#4a5568;font-weight:500">Till Charged</th><th style="text-align:left;padding:4px 10px;color:#4a5568;font-weight:500">Surcharge</th></tr>\`;
+      for (const x of fixed) {
+        html += \`<tr>
+          <td style="padding:4px 10px;color:#c8cdd6">#\${escHtml(x.orderNumber)}</td>
+          <td style="padding:4px 10px;color:#6b7a8d">$\${escHtml(x.shopifyAmount)}</td>
+          <td style="padding:4px 10px;color:#7aaa88">$\${escHtml(x.tillAmount)}</td>
+          <td style="padding:4px 10px;color:#8a7a5a">+$\${escHtml(x.surcharge)}</td>
+        </tr>\`;
+      }
+      html += \`</table>\`;
+    }
+    if (errors.length) {
+      html += \`<div style="margin-top:8px;color:#b87c7c;font-size:12px">\${errors.length} error(s): \${errors.map(x=>x.txnId+': '+escHtml(x.error||x.outcome)).join(', ')}</div>\`;
+    }
+    if (fixed.length) {
+      html += \`<div style="margin-top:10px;color:#344155;font-size:11px">Refresh the page to see the updated paid section.</div>\`;
+    }
+    out.innerHTML = html;
+  } catch(e) {
+    out.innerHTML = '<span style="color:#b87c7c">Request failed: '+escHtml(e.message)+'</span>';
+  } finally {
+    btn.textContent = 'Reconcile All with Till'; btn.disabled = false;
+  }
+}
+
+async function loadTill(uuid, rowId) {
+  const btn = document.getElementById(rowId+'-btn');
+  const detailRow = document.getElementById(rowId+'-detail');
+  const content   = document.getElementById(rowId+'-content');
+  if (detailRow.style.display !== 'none') { detailRow.style.display='none'; btn.textContent='Till Details'; return; }
+
+  btn.textContent='Loading…'; btn.disabled=true;
+  try {
+    const r = await fetch('/admin/api/till/'+encodeURIComponent(uuid)+'?secret='+encodeURIComponent(SECRET));
+    const d = await r.json();
+    content.innerHTML = (!r.ok||d.error) ? '<span style="color:#b87c7c">Error: '+escHtml(d.error||'Unknown')+'</span>' : renderTill(d);
+  } catch(e) { content.innerHTML='<span style="color:#b87c7c">Fetch failed: '+escHtml(e.message)+'</span>'; }
+  detailRow.style.display=''; btn.textContent='Hide Details'; btn.disabled=false;
+}
+function renderTill(d) {
+  const result  = d.result||d.status||'—';
+  const isOk    = result==='OK'||result==='SUCCESS';
+  const card    = d.card||d.paymentInstrument||d.cardData||{};
+  const cardNum = card.lastFourDigits||card.maskedPan||card.last4||'—';
+  const fields  = [
+    ['Till Result',    \`<span class="\${isOk?'till-ok':'till-err'}">\${escHtml(result)}</span>\`],
+    ['Return Type',    escHtml(d.returnType||'—')],
+    ['Till Charged (incl. surcharge)', d.amount!=null?\`<span style="color:#7aaa88">$\${parseFloat(d.amount).toFixed(2)} \${escHtml(d.currency||'')}</span>\`:'—'],
+    ['Card Number',    cardNum!=='—'?\`•••• •••• •••• \${escHtml(cardNum)}\`:'—'],
+    ['Card Type',      escHtml(card.type||card.brand||card.cardType||'—')],
+    ['Card Holder',    escHtml(card.cardHolder||card.holderName||'—')],
+    ['Card Expiry',    (card.expiryMonth&&card.expiryYear)?card.expiryMonth+'/'+card.expiryYear:'—'],
+    ['Settlement Date',escHtml(d.settlementDate||d.settledAt||'—')],
+    ['Transaction Date',escHtml(d.createdAt||d.timestamp||'—')],
+    ['Descriptor',     escHtml(d.descriptor||d.description||'—')],
+    ['Till UUID',      \`<span style="font-family:monospace;font-size:11px">\${escHtml(d.uuid||d.referenceUuid||'—')}</span>\`],
+  ];
+  const grid = fields.map(([l,v])=>\`<div class="till-field"><div class="till-field-lbl">\${l}</div><div class="till-field-val">\${v}</div></div>\`).join('');
+  let errHtml='';
+  if(Array.isArray(d.errors)&&d.errors.length){
+    errHtml='<div style="margin-top:8px;padding:10px;background:#1a1010;border-radius:5px;border:1px solid #4a2020">'+d.errors.map(e=>\`<div style="color:#b87c7c;font-size:12px">[\${escHtml(e.errorCode||'')}] \${escHtml(e.errorMessage||e.message||'')} \${e.adapterMessage?'— '+escHtml(e.adapterMessage):''}</div>\`).join('')+'</div>';
+  }
+  const rt=(d.returnType||'').toUpperCase(), rs=(d.result||'').toUpperCase();
+  const pending=(rt==='REDIRECT'||rs==='PENDING'||(!rs&&!rt))?'<div style="margin-bottom:10px;padding:10px;background:#131e10;border:1px solid #2a3a20;border-radius:5px;color:#7aaa88;font-size:12px">Payment not yet completed by customer.</div>':'';
+  const raw=\`<details style="margin-top:10px"><summary style="cursor:pointer;font-size:11px;color:#344155">Raw Till response</summary><pre style="margin-top:6px;padding:10px;background:#0a0e14;border-radius:5px;font-size:10px;color:#4a5568;overflow-x:auto;white-space:pre-wrap;word-break:break-all">\${escHtml(JSON.stringify(d,null,2))}</pre></details>\`;
+  return \`\${pending}<div class="till-grid">\${grid}</div>\${errHtml}\${raw}\`;
+}
+async function markPaid(txnId, storedAmount, rowId) {
+  const input = prompt(
+    'Enter the amount actually received (check your bank / Till merchant portal).\nStored amount: $' + (storedAmount || '?'),
+    storedAmount || ''
+  );
+  if (input === null) return; // cancelled
+  const amount = input.trim();
+  if (!amount || isNaN(parseFloat(amount))) {
+    alert('Invalid amount — please enter a number like 45.00');
+    return;
+  }
+  const btn = document.getElementById(rowId + '-markbtn');
+  if (btn) { btn.textContent = 'Marking…'; btn.disabled = true; }
+  try {
+    const r = await fetch('/admin/api/mark-paid/' + encodeURIComponent(txnId) + '?secret=' + encodeURIComponent(SECRET), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ amount })
+    });
+    const d = await r.json();
+    if (!r.ok) {
+      if (btn) { btn.textContent = 'Mark Paid'; btn.disabled = false; }
+      alert('Error: ' + escHtml(d.error || 'Unknown error'));
+      return;
+    }
+    // Success — update the row visually
+    if (btn) {
+      btn.textContent = 'Paid ✓';
+      btn.disabled = true;
+      btn.style.background = '#0e1c14';
+      btn.style.color = '#5a8a6a';
+      btn.style.borderColor = '#2a5234';
+      btn.style.cursor = 'default';
+    }
+    // Also update status cell if present
+    const row = document.getElementById(rowId);
+    if (row) {
+      const cells = row.querySelectorAll('td');
+      if (cells[2]) cells[2].innerHTML = '<span style="color:#7aaa88">paid</span>';
+    }
+  } catch(e) {
+    if (btn) { btn.textContent = 'Mark Paid'; btn.disabled = false; }
+    alert('Request failed: ' + escHtml(e.message));
+  }
+}
+
+function escHtml(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+</script>
 </body>
 </html>`);
 });
