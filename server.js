@@ -1530,6 +1530,83 @@ app.get('/api/transactions/:orderNumber', async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
+// ENDPOINT: POST /api/customer-cancel
+// ═════════════════════════════════════════════════════════════════════════════
+// Customer-facing cancel (no API key required).
+// Validates ownership via email, then cancels the Shopify order and marks the
+// local transaction as cancelled.  No Till void is attempted because the
+// customer can only reach this endpoint before a bank authorisation is
+// captured (they haven't completed payment yet).
+//
+// Body:
+//   { "orderNumber": "1042", "email": "customer@example.com", "reason": "..." }
+
+app.post('/api/customer-cancel', async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const { orderNumber, email, reason = 'Customer requested cancellation from payment page' } = req.body || {};
+
+  if (!orderNumber || !email) {
+    return res.status(400).json({ error: 'orderNumber and email are required' });
+  }
+
+  const cleanOrder = String(orderNumber).replace(/^#/, '').trim();
+  logger.info('Customer cancel requested', { requestId, orderNumber: cleanOrder });
+
+  // Look up transaction
+  const txnId = `HOC-${cleanOrder}`;
+  let txn = await getTransaction(txnId);
+  if (!txn) txn = await getTransactionByOrderNumber(cleanOrder);
+  if (!txn) {
+    return res.status(404).json({ error: 'Order not found' });
+  }
+
+  // Verify email ownership (case-insensitive)
+  const storedEmail = (txn.customerEmail || '').toLowerCase().trim();
+  const givenEmail  = email.toLowerCase().trim();
+  if (!storedEmail || storedEmail !== givenEmail) {
+    return res.status(403).json({ error: 'Email does not match order' });
+  }
+
+  if (txn.status === 'paid') {
+    return res.status(400).json({ error: 'Order has already been paid' });
+  }
+
+  if (txn.status === 'cancelled') {
+    return res.json({ status: 'already_cancelled', orderNumber: cleanOrder });
+  }
+
+  // Cancel the Shopify order
+  let shopifyResult = null;
+  if (txn.shopifyOrderId) {
+    try {
+      const cancelRes = await shopifyAdminAPI(
+        'POST',
+        `/orders/${txn.shopifyOrderId}/cancel.json`,
+        { reason: 'customer', email: true }
+      );
+      shopifyResult = { success: cancelRes.status >= 200 && cancelRes.status < 300 };
+      logger.info('Shopify order cancelled by customer', {
+        requestId, txnId: txn.txnId,
+        shopifyOrderId: txn.shopifyOrderId,
+        success: shopifyResult.success
+      });
+    } catch (err) {
+      shopifyResult = { success: false, error: err.message };
+      logger.error('Shopify cancel failed (customer cancel)', { requestId, txnId: txn.txnId, error: err.message });
+    }
+  } else {
+    shopifyResult = { skipped: true, reason: 'No Shopify order ID' };
+  }
+
+  // Mark local transaction as cancelled
+  await saveTransaction({ txnId: txn.txnId, status: 'cancelled' });
+
+  logger.info('Customer cancel complete', { requestId, txnId: txn.txnId, shopifyResult });
+
+  return res.json({ status: 'cancelled', orderNumber: cleanOrder, shopifyResult });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
 // ENDPOINT: POST /api/cancel/:orderNumber
 // ═════════════════════════════════════════════════════════════════════════════
 // Cancel a pending payment:
