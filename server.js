@@ -967,7 +967,7 @@ app.post('/api/shopify-webhook', paymentLimiter, async (req, res) => {
         .update(req.rawBody)
         .digest('base64');
 
-      logger.info'HMAC debug', {
+      logger.info('HMAC debug', {
         requestId,
         rawBodyLen: req.rawBody?.length ?? 'undefined',
         receivedHmac: hmacHeader?.substring(0, 10),
