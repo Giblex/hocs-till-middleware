@@ -77,6 +77,9 @@ const {
 
   // Store URL
   STORE_URL        = 'https://highonchapel.com',
+
+  // Admin dashboard — set a strong secret and visit /admin?secret=<value>
+  DASHBOARD_SECRET = '',
 } = process.env;
 
 // ─── Validate required env vars ─────────────────────────────────────────────
@@ -628,6 +631,34 @@ async function getTransactionByTillUuid(tillUuid) {
 async function getTransactionByPurchaseId(purchaseId) {
   const { rows } = await pool.query('SELECT * FROM transactions WHERE purchase_id = $1 LIMIT 1', [String(purchaseId)]);
   return mapTransactionRow(rows[0]);
+}
+
+async function getAllTransactions({ limit = 200, offset = 0, status = null, search = null } = {}) {
+  let where = 'WHERE 1=1';
+  const params = [];
+  let idx = 1;
+
+  if (status) {
+    where += ` AND status = $${idx++}`;
+    params.push(status);
+  }
+  if (search) {
+    const like = `%${search}%`;
+    where += ` AND (txn_id ILIKE $${idx} OR order_number ILIKE $${idx} OR customer_email ILIKE $${idx} OR till_uuid ILIKE $${idx})`;
+    params.push(like);
+    idx++;
+  }
+
+  params.push(limit, offset);
+  const { rows } = await pool.query(
+    `SELECT * FROM transactions ${where} ORDER BY created_at DESC LIMIT $${idx++} OFFSET $${idx++}`,
+    params
+  );
+  const { rows: countRows } = await pool.query(
+    `SELECT COUNT(*) AS total FROM transactions ${where}`,
+    params.slice(0, -2)
+  );
+  return { rows: rows.map(mapTransactionRow), total: parseInt(countRows[0].total, 10) };
 }
 
 async function resolveTransactionFromCallback(cb) {
@@ -2466,6 +2497,188 @@ app.get('/api/cert/run-all', async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 // Till Developer Certification Test Dashboard — Auto-Run Edition
 // Fires all tests automatically on button click. Shows UUID + remark per test.
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ENDPOINT: GET /admin
+// ═════════════════════════════════════════════════════════════════════════════
+// Transaction dashboard. Protected by DASHBOARD_SECRET query param.
+// Visit: /admin?secret=<DASHBOARD_SECRET>
+// Optional filters: &status=paid|pending|failed|... &search=<text> &page=<n>
+
+app.get('/admin', async (req, res) => {
+  if (!DASHBOARD_SECRET || req.query.secret !== DASHBOARD_SECRET) {
+    return res.status(401).send(`<!DOCTYPE html><html><head><title>401</title></head>
+<body style="font-family:sans-serif;padding:40px;background:#0f1b2d;color:#e2e8f0">
+<h2 style="color:#f87171">Unauthorized</h2>
+<p>Set <code>DASHBOARD_SECRET</code> in your Railway env vars, then visit<br>
+<code>/admin?secret=YOUR_SECRET</code></p></body></html>`);
+  }
+
+  const page    = Math.max(1, parseInt(req.query.page || '1', 10));
+  const limit   = 50;
+  const offset  = (page - 1) * limit;
+  const status  = req.query.status || null;
+  const search  = req.query.search || null;
+  const secret  = req.query.secret;
+
+  let data = { rows: [], total: 0 };
+  let dbError = null;
+  try {
+    data = await getAllTransactions({ limit, offset, status, search });
+  } catch (err) {
+    dbError = err.message;
+  }
+
+  const totalPages = Math.max(1, Math.ceil(data.total / limit));
+  const isLive = !TILL_BASE_URL.includes('test-gateway');
+
+  const statusColors = {
+    paid:             { bg: '#14532d', fg: '#86efac' },
+    pending:          { bg: '#3f2a00', fg: '#fbbf24' },
+    initiated:        { bg: '#1e3a5f', fg: '#93c5fd' },
+    failed:           { bg: '#7f1d1d', fg: '#fca5a5' },
+    amount_mismatch:  { bg: '#7c2d12', fg: '#fdba74' },
+    currency_mismatch:{ bg: '#7c2d12', fg: '#fdba74' },
+    cancelled:        { bg: '#374151', fg: '#9ca3af' },
+    reconciled:       { bg: '#064e3b', fg: '#6ee7b7' },
+  };
+
+  function badge(s) {
+    const c = statusColors[s] || { bg: '#374151', fg: '#d1d5db' };
+    return `<span style="display:inline-block;padding:2px 9px;border-radius:99px;font-size:11px;font-weight:700;background:${c.bg};color:${c.fg}">${s}</span>`;
+  }
+
+  function esc(s) {
+    return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  function fmt(iso) {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    return d.toLocaleDateString('en-AU', { day:'2-digit', month:'short', year:'numeric' })
+      + ' ' + d.toLocaleTimeString('en-AU', { hour:'2-digit', minute:'2-digit', second:'2-digit' });
+  }
+
+  function qs(overrides = {}) {
+    const p = new URLSearchParams({ secret, ...(status ? { status } : {}), ...(search ? { search } : {}) });
+    Object.entries(overrides).forEach(([k, v]) => v != null ? p.set(k, v) : p.delete(k));
+    return '?' + p.toString();
+  }
+
+  const statusOptions = ['', 'paid', 'pending', 'initiated', 'failed', 'amount_mismatch', 'currency_mismatch', 'cancelled', 'reconciled'];
+
+  const rows = data.rows.map(t => `
+  <tr>
+    <td style="font-family:monospace;white-space:nowrap">${esc(t.txnId)}</td>
+    <td style="white-space:nowrap"><a href="https://${esc(SHOPIFY_STORE_DOMAIN)}/admin/orders/${esc(t.shopifyOrderId)}" target="_blank" style="color:#60a5fa;text-decoration:none">#${esc(t.orderNumber)}</a></td>
+    <td>${badge(t.status)}</td>
+    <td style="white-space:nowrap;font-weight:600">${t.amount ? `$${esc(t.amount)} ${esc(t.currency)}` : '—'}</td>
+    <td style="font-size:12px">${esc(t.customerEmail)}</td>
+    <td style="font-family:monospace;font-size:11px;word-break:break-all;max-width:200px">${esc(t.tillUuid) || '—'}</td>
+    <td style="font-size:11px;white-space:nowrap;color:#94a3b8">${fmt(t.createdAt)}</td>
+    <td style="font-size:11px;white-space:nowrap;color:#94a3b8">${fmt(t.updatedAt)}</td>
+    <td style="font-size:11px;color:#f87171;max-width:200px;word-break:break-all">${esc(t.tillError) || ''}</td>
+  </tr>`).join('');
+
+  const filterSelect = statusOptions.map(s =>
+    `<option value="${s}" ${status === s || (!status && s === '') ? 'selected' : ''}>${s || 'All statuses'}</option>`
+  ).join('');
+
+  const prevDisabled = page <= 1;
+  const nextDisabled = page >= totalPages;
+
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HOCS · Transactions</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0b1525;color:#e2e8f0;min-height:100vh;padding:28px 20px}
+h1{font-size:20px;font-weight:700;color:#60a5fa;margin-bottom:2px}
+.sub{color:#64748b;font-size:12px;margin-bottom:20px}
+.env-badge{display:inline-block;padding:2px 9px;border-radius:99px;font-size:10px;font-weight:700;margin-left:8px;vertical-align:middle;background:${isLive ? '#7f1d1d' : '#14532d'};color:${isLive ? '#fca5a5' : '#86efac'}}
+.toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:18px}
+.toolbar input,.toolbar select{background:#1e2d42;border:1px solid #2d3f56;color:#e2e8f0;padding:7px 12px;border-radius:6px;font-size:13px;outline:none}
+.toolbar input:focus,.toolbar select:focus{border-color:#3b82f6}
+.toolbar button{padding:7px 18px;background:#2563eb;color:#fff;border:none;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer}
+.toolbar button:hover{background:#1d4ed8}
+.summary{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:18px}
+.stat{background:#1a2636;border:1px solid #2d3f56;border-radius:8px;padding:12px 18px;min-width:110px}
+.stat-val{font-size:22px;font-weight:700;color:#e2e8f0}
+.stat-lbl{font-size:11px;color:#64748b;margin-top:2px}
+.wrap{overflow-x:auto;border-radius:10px;border:1px solid #1e2d42}
+table{width:100%;border-collapse:collapse;font-size:13px}
+thead tr{background:#1a2d42}
+th{padding:10px 12px;text-align:left;color:#93c5fd;font-weight:600;white-space:nowrap;border-bottom:2px solid #2d3f56}
+td{padding:9px 12px;border-bottom:1px solid #131f2e;vertical-align:top}
+tr:hover td{background:#162030}
+.pagination{display:flex;gap:8px;align-items:center;margin-top:18px;font-size:13px;color:#64748b}
+.pagination a{padding:6px 14px;background:#1e2d42;color:#93c5fd;border-radius:6px;text-decoration:none;border:1px solid #2d3f56}
+.pagination a:hover{background:#2d3f56}
+.pagination .cur{padding:6px 14px;background:#2563eb;color:#fff;border-radius:6px}
+.err{background:#1a0a0a;border:1px solid #7f1d1d;color:#fca5a5;padding:14px;border-radius:8px;margin-bottom:18px;font-size:13px}
+.empty{text-align:center;padding:40px;color:#475569;font-size:14px}
+</style>
+</head>
+<body>
+<h1>HOCS Transactions <span class="env-badge">${isLive ? 'LIVE' : 'SANDBOX'}</span></h1>
+<div class="sub">${esc(SHOPIFY_STORE_DOMAIN)} · ${data.total} total records</div>
+
+${dbError ? `<div class="err">Database error: ${esc(dbError)}</div>` : ''}
+
+<div class="summary">
+  ${['paid','pending','initiated','failed'].map(s => {
+    const count = data.rows.filter(r => r.status === s).length;
+    const c = statusColors[s] || { fg: '#d1d5db' };
+    return `<div class="stat"><div class="stat-val" style="color:${c.fg}">${s === status ? count : '—'}</div><div class="stat-lbl">${s} (this page)</div></div>`;
+  }).join('')}
+  <div class="stat"><div class="stat-val">${data.total}</div><div class="stat-lbl">total (filtered)</div></div>
+</div>
+
+<form class="toolbar" method="GET" action="/admin">
+  <input type="hidden" name="secret" value="${esc(secret)}">
+  <input type="text" name="search" placeholder="Search order, email, UUID…" value="${esc(search || '')}" style="min-width:240px">
+  <select name="status">${filterSelect}</select>
+  <button type="submit">Filter</button>
+  ${(search || status) ? `<a href="${qs({ page: 1, search: null, status: null })}" style="color:#94a3b8;font-size:13px;text-decoration:none">Clear</a>` : ''}
+</form>
+
+<div class="wrap">
+<table>
+<thead><tr>
+  <th>Transaction ID</th>
+  <th>Order</th>
+  <th>Status</th>
+  <th>Amount</th>
+  <th>Customer Email</th>
+  <th>Till UUID</th>
+  <th>Created</th>
+  <th>Updated</th>
+  <th>Error</th>
+</tr></thead>
+<tbody>
+${rows || `<tr><td colspan="9" class="empty">No transactions found.</td></tr>`}
+</tbody>
+</table>
+</div>
+
+<div class="pagination">
+  ${prevDisabled
+    ? `<span style="padding:6px 14px;color:#374151">← Prev</span>`
+    : `<a href="${qs({ page: page - 1 })}">← Prev</a>`}
+  <span class="cur">Page ${page} of ${totalPages}</span>
+  ${nextDisabled
+    ? `<span style="padding:6px 14px;color:#374151">Next →</span>`
+    : `<a href="${qs({ page: page + 1 })}">Next →</a>`}
+  <span style="margin-left:8px;color:#475569">Showing ${offset + 1}–${Math.min(offset + limit, data.total)} of ${data.total}</span>
+</div>
+
+</body>
+</html>`);
+});
 
 app.get('/', (_req, res) => {
   res.setHeader('Content-Type', 'text/html');
