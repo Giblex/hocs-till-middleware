@@ -604,18 +604,6 @@ async function resolveTransactionFromCallback(cb) {
   return { txn: null, matchedBy: null };
 }
 
-async function hasWebhook(orderId) {
-  const { rowCount } = await pool.query('SELECT 1 FROM webhooks WHERE order_id = $1 LIMIT 1', [String(orderId)]);
-  return rowCount > 0;
-}
-
-async function markWebhook(orderId) {
-  await pool.query(
-    'INSERT INTO webhooks (order_id, created_at) VALUES ($1, NOW()) ON CONFLICT (order_id) DO NOTHING',
-    [String(orderId)]
-  );
-}
-
 function normalizeTillValue(value) {
   return typeof value === 'string' ? value.trim().toUpperCase() : '';
 }
@@ -1014,14 +1002,36 @@ app.post('/api/shopify-webhook', paymentLimiter, async (req, res) => {
 
     logger.info('Processing order', { requestId, orderId, orderNumber, totalPrice, currency });
 
-    // ── 3. Idempotency: skip if already processed (Rec #8) ───────────────
+    // ── 3. Idempotency: atomic claim (Rec #8) ────────────────────────────
+    // Single-statement INSERT ... ON CONFLICT eliminates the race between
+    // check-and-set. If we don't win the claim, another concurrent webhook
+    // already owns this order — either it produced a transaction (skip), or
+    // a prior attempt crashed mid-flight (release the stale claim and ask
+    // Shopify to retry).
     const txnId = `HOC-${orderNumber}`;  // Deterministic, idempotent ID (Rec #4)
-    if (await hasWebhook(orderId)) {
-      logger.info('Duplicate webhook — skipping', { requestId, orderId });
-      return res.status(200).json({ status: 'already_processed' });
-    }
-    await markWebhook(orderId);
+    const claim = await pool.query(
+      `INSERT INTO webhooks (order_id, created_at) VALUES ($1, NOW())
+       ON CONFLICT (order_id) DO NOTHING RETURNING order_id`,
+      [String(orderId)]
+    );
 
+    if (claim.rowCount === 0) {
+      const existing = await getTransaction(txnId);
+      if (existing) {
+        logger.info('Duplicate webhook — already initiated', { requestId, orderId, txnId });
+        return res.status(200).json({ status: 'already_processed', txnId });
+      }
+      // Claim row exists but no transaction was ever saved → prior attempt
+      // died between markWebhook and saveTransaction. Release the stale
+      // claim and return 503 so Shopify redelivers.
+      logger.warn('Stale webhook claim with no transaction — releasing', { requestId, orderId, txnId });
+      await pool.query('DELETE FROM webhooks WHERE order_id = $1', [String(orderId)]);
+      return res.status(503).json({ error: 'transient_state_retry' });
+    }
+
+    // We won the claim. Belt-and-braces: if a transaction already exists for
+    // this txnId (e.g. order_number reused, or webhooks table was cleared),
+    // skip rather than double-initiate.
     if (await getTransaction(txnId)) {
       logger.info('Transaction already initiated — skipping', { requestId, txnId });
       return res.status(200).json({ status: 'already_initiated', txnId });
