@@ -972,23 +972,21 @@ app.post('/api/shopify-webhook', paymentLimiter, async (req, res) => {
     }
 
     if (!verified) {
-      logger.alert('Shopify webhook HMAC verification FAILED', {
+      // Returning 401 here causes Shopify to retry for 48h, flooding the logs.
+      // These failures are almost always from orphaned app installations whose
+      // client_secret we no longer have. Log once, then ack with 200 so the
+      // retries stop. Real signed webhooks still get processed below.
+      logger.warn('Shopify webhook HMAC verification rejected (acked to stop retries)', {
         requestId,
         shopifyWebhookId: req.get('X-Shopify-Webhook-Id') || 'missing',
         shopifyTopic: req.get('X-Shopify-Topic') || 'missing',
         shopifyApiVersion: req.get('X-Shopify-Api-Version') || 'missing',
         shopifyTriggeredAt: req.get('X-Shopify-Triggered-At') || 'missing',
-        secretLen: SHOPIFY_WEBHOOK_SECRET?.length || 0,
-        secretPrefix: SHOPIFY_WEBHOOK_SECRET?.substring(0, 6) || 'UNSET',
-        clientSecretLen: SHOPIFY_CLIENT_SECRET?.length || 0,
-        clientSecretPrefix: SHOPIFY_CLIENT_SECRET?.substring(0, 6) || 'UNSET',
-        storeSecretLen: SHOPIFY_STORE_WEBHOOK_SECRET?.length || 0,
-        storeSecretPrefix: SHOPIFY_STORE_WEBHOOK_SECRET?.substring(0, 6) || 'UNSET',
         secretsTriedCount: uniqueSecrets.length,
         rawBodyLen: req.rawBody?.length || 0,
         hmacHeaderLen: hmacHeader?.length || 0,
       });
-      return res.status(401).json({ error: 'HMAC verification failed' });
+      return res.status(200).json({ status: 'rejected_unverified' });
     }
 
     logger.info('Shopify webhook HMAC verified', { requestId });
