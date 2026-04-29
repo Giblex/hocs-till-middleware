@@ -4158,6 +4158,45 @@ function payPortalHTML(title, bodyContent, showPoll, pollUrl, reloadUrl) {
 </html>`;
 }
 
+// ─── Weekly Orders Report ────────────────────────────────────────────────────
+
+const cron = require('node-cron');
+const { generateAndSendReport } = require('./lib/weekly-report');
+
+// Manual trigger for testing — POST so it isn't accidentally hit. Auth via the
+// existing DASHBOARD_SECRET so only admins can invoke it.
+app.post('/api/admin/send-weekly-report', async (req, res) => {
+  const secret = req.query.secret || req.get('X-Admin-Secret');
+  if (!DASHBOARD_SECRET || secret !== DASHBOARD_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  const sinceDays = parseInt(req.query.sinceDays || '7', 10);
+  const isTest = req.query.test !== '0';
+  try {
+    const result = await generateAndSendReport({
+      pool, shopifyAdminAPI, logger, sinceDays, isTest
+    });
+    return res.json({ ok: true, ...result });
+  } catch (err) {
+    logger.error('Manual weekly report failed', { error: err.message, stack: err.stack });
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Cron: every Monday at 08:07 local server time (Railway uses UTC).
+// Pick a non-:00 minute to avoid the global cron stampede.
+cron.schedule('7 8 * * 1', async () => {
+  logger.info('Weekly orders report — cron fired');
+  try {
+    const result = await generateAndSendReport({
+      pool, shopifyAdminAPI, logger, sinceDays: 7, isTest: false
+    });
+    logger.info('Weekly orders report — sent', result);
+  } catch (err) {
+    logger.error('Weekly orders report — failed', { error: err.message, stack: err.stack });
+  }
+});
+
 // ─── Start Server ───────────────────────────────────────────────────────────
 
 initDatabase()
@@ -4168,7 +4207,8 @@ initDatabase()
         env: NODE_ENV,
         tillEndpoint: TILL_BASE_URL,
         shopifyStore: SHOPIFY_STORE_DOMAIN,
-        callbackUrl: CALLBACK_URL
+        callbackUrl: CALLBACK_URL,
+        weeklyReport: 'Mon 08:07 UTC'
       });
     });
   })
