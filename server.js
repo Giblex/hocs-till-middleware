@@ -32,6 +32,7 @@ const path       = require('path');
 const fetch      = require('node-fetch');   // node-fetch@2 for CJS compatibility
 const rateLimit  = require('express-rate-limit');
 const { Pool }   = require('pg');
+const { sendGuestConfirmationEmail } = require('./lib/email-service');
 
 // Optional: Puppeteer for HPP auto-completion (cert testing)
 let puppeteer;
@@ -1350,6 +1351,31 @@ app.post('/api/till-callback', async (req, res) => {
       if (markResult.success) {
         await saveTransaction({ txnId: original.txnId, status: 'paid', tillUuid });
         logger.info('Shopify order marked as paid', { requestId, txnId: original.txnId, shopifyOrderId: original.shopifyOrderId });
+
+        // ── 5.1 Send Guest Confirmation Email ───────────────────────────
+        // Fire and forget — don't block the callback response
+        if (original.customerEmail) {
+          sendGuestConfirmationEmail({
+            to: original.customerEmail,
+            orderNumber: original.orderNumber,
+            amount: original.amount,
+            currency: original.currency,
+            storeUrl: STORE_URL,
+            logger
+          }).catch(err => {
+            logger.error('Background error sending guest confirmation email', {
+              requestId,
+              txnId: original.txnId,
+              error: err.message
+            });
+          });
+        } else {
+          logger.warn('No customer email found for guest confirmation email', {
+            requestId,
+            txnId: original.txnId,
+            orderNumber: original.orderNumber
+          });
+        }
       } else {
         logger.error('Failed to mark Shopify order as paid', {
           requestId, txnId: original.txnId,
@@ -1472,6 +1498,25 @@ app.post('/api/reconcile/:orderNumber', async (req, res) => {
           logger.info('Manual reconciliation — order marked as paid', {
             requestId, txnId: txn.txnId, orderNumber
           });
+
+          // ── Send Guest Confirmation Email ─────────────────────────────
+          if (txn.customerEmail) {
+            sendGuestConfirmationEmail({
+              to: txn.customerEmail,
+              orderNumber: txn.orderNumber,
+              amount: txn.amount,
+              currency: txn.currency,
+              storeUrl: STORE_URL,
+              logger
+            }).catch(err => {
+              logger.error('Background error sending guest confirmation email (reconcile)', {
+                requestId,
+                txnId: txn.txnId,
+                error: err.message
+              });
+            });
+          }
+
           return res.json({
             status: 'reconciled',
             txnId: txn.txnId,
