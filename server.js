@@ -4228,9 +4228,10 @@ app.post('/api/admin/send-weekly-report', async (req, res) => {
   }
 });
 
-// Cron: every Monday at 08:07 local server time (Railway uses UTC).
-// Pick a non-:00 minute to avoid the global cron stampede.
-cron.schedule('7 8 * * 1', async () => {
+// Cron: every Sunday at 21:23 Melbourne time (9:23 PM local — "Sunday night").
+// Using the Melbourne timezone keeps it consistent across AEST/AEDT changes.
+// Minute is :23 to dodge the global :00/:30 cron stampede.
+cron.schedule('23 21 * * 0', async () => {
   logger.info('Weekly orders report — cron fired');
   try {
     const result = await generateAndSendReport({
@@ -4240,7 +4241,7 @@ cron.schedule('7 8 * * 1', async () => {
   } catch (err) {
     logger.error('Weekly orders report — failed', { error: err.message, stack: err.stack });
   }
-});
+}, { timezone: 'Australia/Melbourne' });
 
 // ─── Start Server ───────────────────────────────────────────────────────────
 
@@ -4253,7 +4254,7 @@ initDatabase()
         tillEndpoint: TILL_BASE_URL,
         shopifyStore: SHOPIFY_STORE_DOMAIN,
         callbackUrl: CALLBACK_URL,
-        weeklyReport: 'Mon 08:07 UTC'
+        weeklyReport: 'Sun 21:23 Australia/Melbourne'
       });
     });
   })
