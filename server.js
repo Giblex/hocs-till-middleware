@@ -1386,23 +1386,42 @@ app.post('/api/till-callback', async (req, res) => {
       }
 
     } else if (normalizedResult === 'ERROR' || normalizedReturnType === 'ERROR' || normalizedStatus === 'ERROR' || hasCallbackErrors) {
-      await saveTransaction({ txnId: original.txnId, status: 'failed', tillUuid });
-      const errorCode = cb.errors?.[0]?.errorCode;
-      const errorMsg  = cb.errors?.[0]?.errorMessage || cb.errors?.[0]?.message || 'unknown';
-      const adapterCode = cb.errors?.[0]?.adapterCode || '';
-      const adapterMsg  = cb.errors?.[0]?.adapterMessage || '';
+      // Till exposes failure details at BOTH the top level and (sometimes)
+      // inside an errors[] array. Read whichever is present so we never
+      // fall through to "unhandled".
+      const topErr = cb.errors?.[0] || {};
+      const errorCode = topErr.errorCode ?? topErr.code ?? cb.code ?? null;
+      const errorMsg = topErr.errorMessage || topErr.message || cb.message || 'unknown';
+      const adapterCode = topErr.adapterCode || cb.adapterCode || '';
+      const adapterMsg  = topErr.adapterMessage || cb.adapterMessage || '';
+      const cardType = cb.returnData?.type || '';
+
+      await saveTransaction({
+        txnId: original.txnId,
+        status: 'failed',
+        tillUuid,
+        tillError: `${errorCode || '?'} ${errorMsg}${adapterCode ? ` (${adapterCode})` : ''}`.substring(0, 500)
+      });
 
       logger.error('PAYMENT FAILED DETAILS', {
         requestId, txnId: original.txnId, tillUuid,
-        errorCode, errorMsg, adapterCode, adapterMsg,
-        fullErrors: JSON.stringify(cb.errors),
+        errorCode, errorMsg, adapterCode, adapterMsg, cardType,
+        fullErrors: JSON.stringify(cb.errors || []),
         fullBody: JSON.stringify(cb).substring(0, 1000)
       });
 
-      if (errorCode === 1004) {
+      // Specific known reasons → targeted alerts
+      if (adapterCode === '3ds_config_error' || /no acquirer configured/i.test(errorMsg)) {
+        // Card type not enabled on the Till merchant account (typically Amex).
+        logger.alert('Till — card type not supported by acquirer (likely Amex)', {
+          requestId, txnId: original.txnId, cardType, errorMsg, adapterMsg
+        });
+      } else if (errorCode === 1004) {
         logger.alert('Till payment error 1004 — check connector/config', { requestId, txnId: original.txnId, errorMsg, adapterMsg });
       } else if (errorCode === 2003) {
         logger.alert('Till payment declined (2003)', { requestId, txnId: original.txnId, errorMsg, adapterMsg });
+      } else if (errorCode === 2005) {
+        logger.warn('Till — card expired (2005)', { requestId, txnId: original.txnId, errorMsg, adapterMsg });
       } else if (errorCode === 2021) {
         logger.alert('Till 3DS verification failed (2021)', { requestId, txnId: original.txnId, errorMsg, adapterMsg });
       } else if (errorCode === 3004) {
