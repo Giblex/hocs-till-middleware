@@ -21,7 +21,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root  = Split-Path -Parent $PSScriptRoot
-$theme = 'C:\Users\Main\OneDrive\Documents\Work\HOCS\Website\Shoppify theme HTML'
+# Theme has its own git repo (Giblex/hocs-shopify-theme) connected to Shopify
+# via the GitHub theme integration. We push to GitHub; Shopify auto-deploys.
+$theme = 'C:\Users\Main\hocs-theme-new'
 $store = 'highonchapel.myshopify.com'
 
 # ── Middleware → Railway via git push ─────────────────────────────────────────
@@ -43,26 +45,27 @@ if (-not $SkipMiddleware) {
   }
 }
 
-# ── Theme → Shopify via CLI push ──────────────────────────────────────────────
+# ── Theme → GitHub → Shopify (auto-deploys via GitHub theme integration) ─────
 if (-not $SkipTheme) {
-  Write-Host "`n=== Theme → Shopify ===" -ForegroundColor Cyan
+  Write-Host "`n=== Theme → GitHub (Shopify auto-deploys) ===" -ForegroundColor Cyan
   if (-not (Test-Path $theme)) {
     Write-Host "Theme folder not found: $theme" -ForegroundColor Red
     exit 1
   }
   Set-Location $theme
-
-  $args = @('theme', 'push', "--store=$store", '--allow-live', '--ignore=build_projects_structure_*.txt', '--ignore=Ignore Presets/*')
-  if ($Live) {
-    Write-Host "Pushing to LIVE theme — Ctrl+C now if that's not what you want." -ForegroundColor Yellow
-    Start-Sleep -Seconds 3
-    $args += '--live'
-  } else {
-    $args += @('--unpublished', '--theme=hocs-dev')
+  $status = git status --porcelain
+  if ($status) {
+    Write-Host "Uncommitted theme changes detected — staging and committing." -ForegroundColor Yellow
+    git add -A
+    git -c user.email=Giblex@users.noreply.github.com commit -m "deploy: auto-commit from deploy-all.ps1"
   }
-  & shopify @args
-  if ($LASTEXITCODE -ne 0) { Write-Host "Theme push failed." -ForegroundColor Red; exit $LASTEXITCODE }
-  Write-Host "Theme pushed." -ForegroundColor Green
+  $ahead = git rev-list --count '@{u}..HEAD' 2>$null
+  if ($ahead -and [int]$ahead -gt 0) {
+    git push
+    Write-Host "Pushed $ahead theme commit(s). Shopify will pull within ~30s." -ForegroundColor Green
+  } else {
+    Write-Host "Nothing new to push for theme." -ForegroundColor Gray
+  }
 }
 
 Write-Host "`nAll done." -ForegroundColor Green
